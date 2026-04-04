@@ -213,6 +213,9 @@ class LLMSettings(HonchoSettings):
     VLLM_API_KEY: str | None = None
     VLLM_BASE_URL: str | None = None
 
+    # ACP provider (routes LLM calls through an external ACP gateway)
+    ACP_GATEWAY_URL: str | None = None
+    ACP_TIMEOUT_MS: Annotated[int, Field(default=120000, gt=0, le=600000)] = 120000
     EMBEDDING_PROVIDER: Literal["openai", "gemini", "openrouter"] = "openai"
 
     # General LLM settings

@@ -446,6 +446,8 @@ class Conclusion(BaseModel):
         serialization_alias="observed_id",
     )
     session_name: str | None = Field(default=None, serialization_alias="session_id")
+    level: str | None = Field(default=None, description="Observation level")
+    source_ids: list[str] | None = Field(default=None, description="Source observation IDs")
     created_at: datetime.datetime
 
     model_config = ConfigDict(  # pyright: ignore
@@ -486,6 +488,8 @@ class ConclusionCreate(BaseModel):
         default=None,
         description="A session ID to store the conclusion in, if specified",
     )
+    level: str | None = Field(default=None, description="Observation level")
+    source_ids: list[str] | None = Field(default=None, description="Source observation IDs")
 
     _token_count: int = PrivateAttr(default=0)
 

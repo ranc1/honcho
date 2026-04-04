@@ -284,6 +284,9 @@ if settings.LLM.GROQ_API_KEY:
     groq = AsyncGroq(api_key=settings.LLM.GROQ_API_KEY)
     CLIENTS["groq"] = groq
 
+# ACP provider (routes LLM calls through an external ACP gateway)
+if settings.LLM.ACP_GATEWAY_URL:
+    CLIENTS["acp"] = settings.LLM.ACP_GATEWAY_URL  # Not a client object — just the URL. Handled specially in honcho_llm_call_inner.
 SELECTED_PROVIDERS = [
     ("Summary", settings.SUMMARY.PROVIDER),
     ("Deriver", settings.DERIVER.PROVIDER),
@@ -1681,6 +1684,20 @@ async def honcho_llm_call_inner(
     system_messages: list[str] = []
     non_system_messages: list[dict[str, Any]] = []
 
+    # ACP provider — route through ACP gateway HTTP bridge
+    if isinstance(client, str) and provider == "acp":
+        from src.utils.acp_provider import honcho_llm_call_inner_acp
+        return await honcho_llm_call_inner_acp(
+            gateway_url=client,
+            messages=params["messages"],
+            model=model,
+            max_tokens=max_tokens,
+            response_model=response_model,
+            json_mode=json_mode,
+            tools=tools,
+            stream=stream,
+            timeout_ms=settings.LLM.ACP_TIMEOUT_MS,
+        )
     match client:
         case AsyncAnthropic():
             # Anthropic requires system messages to be passed as a top-level parameter
@@ -2369,6 +2386,23 @@ async def handle_streaming_response(
     Yields:
         HonchoLLMCallStreamChunk: Individual chunks of the streaming response
     """
+    # ACP provider — route through ACP gateway HTTP bridge (streaming path)
+    if isinstance(client, str) and provider == "acp":
+        from src.utils.acp_provider import honcho_llm_call_inner_acp
+        _acp_result = await honcho_llm_call_inner_acp(
+            gateway_url=client,
+            messages=params["messages"],
+            model=model,
+            max_tokens=max_tokens,
+            response_model=response_model,
+            json_mode=json_mode,
+            tools=tools,
+            stream=False,
+            timeout_ms=settings.LLM.ACP_TIMEOUT_MS,
+        )
+        _text = _acp_result.content if isinstance(_acp_result.content, str) else str(_acp_result.content)
+        yield HonchoLLMCallStreamChunk(content=_text, is_done=True, finish_reasons=["stop"])
+        return
     match client:
         case AsyncAnthropic():
             # Anthropic requires system messages as a top-level parameter
