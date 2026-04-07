@@ -42,7 +42,7 @@ def upgrade() -> None:
     op.alter_column(
         "message_embeddings",
         "embedding",
-        existing_type=Vector(1536),
+        existing_type=Vector(1024),
         nullable=True,
         schema=schema,
     )
@@ -50,7 +50,7 @@ def upgrade() -> None:
     op.alter_column(
         "documents",
         "embedding",
-        existing_type=Vector(1536),
+        existing_type=Vector(1024),
         nullable=True,
         schema=schema,
     )
