@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 TOOL_NAME_MAP: dict[str, str] = {
     # Map Honcho internal tool names → Honcho canonical MCP tool names
-    # (matching the official Honcho MCP server at honcho/mcp/src/tools/)
+    # (matching the Python MCP server at src/mcp_server.py)
     "search_memory": "query_conclusions",
     "create_observations": "create_conclusions",
     "delete_observations": "delete_conclusion",

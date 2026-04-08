@@ -1,8 +1,7 @@
 """
 Python MCP Server for Honcho — runs inside the FastAPI process.
 
-Exposes 10 tools via JSON-RPC MCP protocol at POST /mcp, matching the
-simplified TypeScript MCP (honcho-fork/mcp/src/index.ts) exactly:
+Exposes 10 tools via JSON-RPC MCP protocol at POST /mcp:
 
   Conclusions: list_conclusions, query_conclusions, create_conclusions, delete_conclusion
   Peers:       chat, get_peer_card, set_peer_card, get_peer_context

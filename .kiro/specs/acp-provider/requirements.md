@@ -59,7 +59,7 @@ The fork also fixes upstream bugs in the Conclusion API where observation levels
 
 #### Acceptance Criteria
 
-1. THE MCP server (`mcp/src/index.ts`) SHALL run as a standalone Express HTTP server using the MCP SDK's `StreamableHTTPServerTransport`.
+1. THE MCP server (`src/mcp_server.py`) SHALL run as a FastAPI router mounted on the main Honcho app at `POST /mcp`.
 2. THE MCP server SHALL expose all upstream Honcho canonical tools (`list_conclusions`, `query_conclusions`, `create_conclusions`, `delete_conclusion`, `chat`, `get_peer_card`, `set_peer_card`, `get_peer_context`) using the original upstream tool files.
 3. THE MCP server SHALL expose `honcho_extract_facts` (custom) which writes structured deriver output to a single-slot in-memory extraction store.
 4. THE MCP server SHALL expose `honcho_get_reasoning_chain` (custom) which traverses `source_ids` via BFS using Honcho's REST API.

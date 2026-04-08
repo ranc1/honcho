@@ -145,7 +145,7 @@ Fixed `create_observations()` in `src/crud/document.py`:
 
 A Python MCP server implemented as a FastAPI router, mounted on the main Honcho FastAPI app at `/mcp`. Runs in the same process as the Honcho API server. Exposes 10 tools matching the canonical MCP tool names.
 
-**Why Python, not TypeScript:** The original upstream MCP was a Cloudflare Workers TypeScript app. We converted it to a simplified standalone Express server (`mcp/src/index.ts`), then migrated to Python running inside the FastAPI process. Benefits:
+**Why Python, not TypeScript:** The original upstream MCP was a Cloudflare Workers TypeScript app. We migrated it to Python running inside the FastAPI process. Benefits:
 1. No Node.js in the Docker image — pure Python container
 2. `honcho_get_reasoning_chain` reuses Honcho's internal `_handle_get_reasoning_chain` handler directly (same process, direct DB access)
 3. `honcho_extract_facts` stores results in a module-level variable accessible via `GET /mcp/extraction` for the deriver process
