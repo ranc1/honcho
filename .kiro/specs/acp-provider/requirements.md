@@ -36,7 +36,7 @@ The fork also fixes upstream bugs in the Conclusion API where observation levels
 5. THE `handle_streaming_response()` function SHALL dispatch to the ACP provider for the streaming path, making a non-streaming call and yielding a single chunk with `is_done=True`.
 6. THE ACP provider module (`src/utils/acp_provider.py`) SHALL implement `honcho_llm_call_inner_acp()` matching the same interface as other provider implementations.
 7. WHEN handling a non-agentic call (deriver or summarizer), THE ACP provider SHALL extract system and user messages, POST `{ module, prompt, systemPrompt? }` to `{gateway_url}/api/v1/acp/prompt`, and return the text response.
-8. WHEN handling a deriver call with `response_model`, THE ACP provider SHALL append an instruction to the prompt telling the engine to call the `honcho_extract_facts` MCP tool. It SHALL then parse the response as JSON into the `response_model`. IF the response is not valid JSON, it SHALL log a warning and return an empty result (extraction skipped).
+8. WHEN handling a deriver call with `response_model`, THE ACP provider SHALL append an instruction to the prompt telling the engine to call the `honcho_extract_facts` MCP tool. After receiving the bridge response, it SHALL first check the co-located MCP extraction store (`GET http://localhost:{MCP_PORT}/extraction`) for structured output from the tool. If found, parse it via `parse_deriver_response()`. If not found, fall back to parsing the raw text response. IF neither produces valid JSON, log a warning and return an empty result (extraction skipped).
 9. WHEN handling an agentic call (dreamer or dialectic), THE ACP provider SHALL construct a combined prompt with `[System Instructions]`, `[Task]`, and `[Available Tools]` sections. Tool names SHALL be mapped from Honcho internal names to canonical MCP names via `TOOL_NAME_MAP`. The gateway engine's tool-calling loop handles MCP tool execution; Honcho's `_execute_tool_loop` is bypassed.
 10. THE ACP provider SHALL detect the calling module via `detect_module()`: tools present with `delete_observations`/`finish_consolidation` → dreamer; tools present otherwise → dialectic; no tools + keyword match → deriver/dreamer/dialectic/summarizer; default → summarizer.
 11. THE `TOOL_NAME_MAP` SHALL map Honcho internal tool names to canonical MCP names matching the official Honcho MCP server: `search_memory` → `query_conclusions`, `create_observations` → `create_conclusions`, `delete_observations` → `delete_conclusion`, `update_peer_card` → `set_peer_card`, `get_reasoning_chain` → `honcho_get_reasoning_chain`, `search_messages`/`grep_messages` → `get_session_messages`, `get_recent_observations`/`get_most_derived_observations` → `list_conclusions`, `get_peer_card` → `get_peer_card`, `finish_consolidation` → `query_conclusions`, `extract_preferences` → `get_session_messages`.
@@ -51,3 +51,19 @@ The fork also fixes upstream bugs in the Conclusion API where observation levels
 
 1. THE embedding client SHALL use `qwen3-embedding:0.6b` as the default model for the `openrouter` provider (`src/embedding_client.py`).
 2. THE SQLAlchemy vector column definitions SHALL use `Vector(1024)` dimensions for both `MessageEmbedding.embedding` and `Document.embedding` (`src/models.py`), matching the output dimensions of `qwen3-embedding:0.6b`.
+3. THE Alembic migration scripts SHALL use `Vector(1024)` dimensions in all `embedding` column definitions, matching the model and SQLAlchemy definitions.
+
+### Requirement 4: Standalone MCP Server
+
+**User Story:** As a developer, I want the Honcho fork to include a standalone MCP server that runs alongside the API in Docker, so that the CLI engine can access Honcho tools and the deriver can use structured extraction.
+
+#### Acceptance Criteria
+
+1. THE MCP server (`mcp/src/index.ts`) SHALL run as a standalone Express HTTP server using the MCP SDK's `StreamableHTTPServerTransport`.
+2. THE MCP server SHALL expose all upstream Honcho canonical tools (`list_conclusions`, `query_conclusions`, `create_conclusions`, `delete_conclusion`, `chat`, `get_peer_card`, `set_peer_card`, `get_peer_context`) using the original upstream tool files.
+3. THE MCP server SHALL expose `honcho_extract_facts` (custom) which writes structured deriver output to a single-slot in-memory extraction store.
+4. THE MCP server SHALL expose `honcho_get_reasoning_chain` (custom) which traverses `source_ids` via BFS using Honcho's REST API.
+5. THE MCP server SHALL expose `GET /extraction` to allow the ACP provider to read and consume the extraction result.
+6. THE MCP server SHALL be configured via environment variables: `MCP_PORT` (default 3100), `HONCHO_BASE_URL`, `HONCHO_API_KEY`, `HONCHO_WORKSPACE_ID`.
+7. THE Dockerfile SHALL build the MCP server in a separate stage (Node.js) and copy the output to the final image alongside the Python app.
+8. THE Docker container command SHALL start the MCP server alongside the API and deriver.

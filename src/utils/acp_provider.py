@@ -296,9 +296,36 @@ async def honcho_llm_call_inner_acp(
 
     # Parse response based on call type
     if response_model is not None:
-        # Deriver call — parse structured output
-        parsed = parse_deriver_response(response_text, response_model)
+        # Deriver call — check the MCP extraction store.
+        # The CLI engine calls honcho_extract_facts MCP tool during the prompt,
+        # which stores structured JSON in the FastAPI process's MCP endpoint.
+        # The deriver runs in a separate process, so we read via HTTP.
+        extraction_text = await _fetch_extraction_result()
+        if extraction_text:
+            logger.info(f"ACP provider: using tool-extracted result for {module} ({len(extraction_text)} chars)")
+            parsed = parse_deriver_response(extraction_text, response_model)
+        else:
+            # Fallback: try parsing the raw text response
+            parsed = parse_deriver_response(response_text, response_model)
         return AcpLLMResponse(content=parsed)
 
     # Plain text response (summarizer, agentic calls)
     return AcpLLMResponse(content=response_text)
+
+
+async def _fetch_extraction_result() -> str | None:
+    """
+    Fetch extraction result from the MCP endpoint's extraction store.
+    The MCP server runs in the FastAPI process (separate from the deriver).
+    """
+    url = "http://localhost:8000/mcp/extraction"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("text")
+            return None
+    except Exception as e:
+        logger.warning(f"Failed to fetch extraction result: {e}")
+        return None

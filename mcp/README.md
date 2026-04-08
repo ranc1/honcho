@@ -1,105 +1,52 @@
 # Honcho MCP Server
 
-A Cloudflare Worker that implements the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for [Honcho](https://honcho.dev), providing AI memory and personalization tools to LLM clients like Claude Desktop.
+A standalone HTTP server implementing the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for [Honcho](https://honcho.dev), providing AI memory and personalization tools to LLM clients.
 
-## Quickstart: Use the Hosted Server
+This fork runs as a standalone Express server inside Docker (not Cloudflare Workers), alongside the Honcho API and deriver worker.
 
-1. Get an API key at <https://app.honcho.dev>
-2. Add Honcho to your Claude Desktop config:
+## Tools
 
-```json
-{
-  "mcpServers": {
-    "honcho": {
-      "command": "bunx",
-      "args": [
-        "mcp-remote",
-        "https://mcp.honcho.dev",
-        "--header",
-        "Authorization:${AUTH_HEADER}",
-        "--header",
-        "X-Honcho-User-Name:${USER_NAME}"
-      ],
-      "env": {
-        "AUTH_HEADER": "Bearer <your-honcho-key>",
-        "USER_NAME": "<your-name>"
-      }
-    }
-  }
-}
-```
+| Tool | Description |
+|---|---|
+| `list_conclusions` | List conclusions (facts/observations) about a peer |
+| `query_conclusions` | Semantic search across conclusions |
+| `create_conclusions` | Create conclusions about a peer |
+| `delete_conclusion` | Delete a conclusion by ID |
+| `chat` | Ask Honcho a question about a peer (LLM-powered reasoning) |
+| `get_peer_card` | Get biographical facts about a peer |
+| `set_peer_card` | Update a peer's card |
+| `get_peer_context` | Combined representation + peer card |
+| `honcho_get_reasoning_chain` | Traverse source_ids to get the full reasoning chain |
+| `honcho_extract_facts` | Structured deriver output (writes to extraction store) |
 
-### Optional Headers
+## Endpoints
 
-| Header | Default | Description |
-| --- | --- | --- |
-| `X-Honcho-Workspace-ID` | `"default"` | Workspace to operate in |
+- `POST /mcp` — MCP Streamable HTTP transport (JSON-RPC 2.0)
+- `GET /extraction` — Pop extraction result (for ACP provider)
+- `GET /health` — Health check
 
-## Available Tools
+## Configuration
 
-**Workspace:** `inspect_workspace` (aggregates metadata, configuration, and peer/session IDs), `list_workspaces` (enumerates accessible workspaces), `search` (semantic search scoped by optional peer/session params), `get_metadata`, `set_metadata`
-
-**Peers:** `create_peer`, `list_peers`, `chat`, `get_peer_card`, `set_peer_card`, `get_peer_context`, `get_representation`
-
-**Sessions:** `create_session`, `list_sessions`, `delete_session`, `clone_session`, `add_peers_to_session`, `remove_peers_from_session`, `get_session_peers`, `inspect_session`, `add_messages_to_session`, `get_session_messages`, `get_session_message`, `get_session_context`
-
-**Conclusions:** `list_conclusions`, `query_conclusions`, `create_conclusions`, `delete_conclusion`
-
-**System:** `schedule_dream`, `get_queue_status`
-
-## Architecture
-
-```
-src/
-  index.ts              # Worker entry point — parse config, delegate to MCP handler
-  server.ts             # createServer() — registers all tools on an McpServer
-  config.ts             # HonchoConfig, parseConfig(), createClient()
-  types.ts              # ToolContext, result helpers
-  tools/
-    workspace.ts        # inspect, list, search, metadata
-    peers.ts            # CRUD, chat, card, context, representation
-    sessions.ts         # CRUD, peers, messages, inspect, context, clone
-    conclusions.ts      # list, query, create, delete
-    system.ts           # dream, queue status
-```
-
-Built on:
-
-- **[agents](https://www.npmjs.com/package/agents)** — `createMcpHandler` for Cloudflare Workers
-- **[@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk)** — `McpServer` for tool registration
-- **[@honcho-ai/sdk](https://www.npmjs.com/package/@honcho-ai/sdk)** v2 — Honcho TypeScript SDK
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_PORT` | `3100` | HTTP server port |
+| `HONCHO_BASE_URL` | `http://localhost:8000` | Honcho API URL |
+| `HONCHO_API_KEY` | `local` | API key (unused for self-hosted) |
+| `HONCHO_WORKSPACE_ID` | `default` | Workspace ID |
 
 ## Development
 
-### Setup
-
 ```bash
-bun install
+npm install
+npm run dev    # Run with tsx (hot reload)
+npm run build  # Compile TypeScript
+npm start      # Run compiled output
 ```
 
-### Local dev
+## Docker
 
-```bash
-bun dev
+The MCP server runs automatically inside the Honcho Docker container. The Dockerfile builds it in a separate stage and copies the output to `/app/mcp/`. The container command starts it alongside the API and deriver:
+
 ```
-
-### Type-check
-
-```bash
-bun run tsc --noEmit
-```
-
-### Test locally
-
-```bash
-bunx mcp-remote http://localhost:8787 \
-  --header "Authorization:Bearer <key>" \
-  --header "X-Honcho-User-Name:test"
-```
-
-### Deploy
-
-```bash
-bun run deploy              # production
-bun run deploy:staging      # staging
+sh -c "alembic upgrade head && python -m src.deriver & node /app/mcp/dist/index.js & fastapi run --host 0.0.0.0 --port 8000 src/main.py"
 ```
