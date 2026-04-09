@@ -5,6 +5,12 @@ This module implements the same contract as other LLM providers in honcho_llm_ca
 Instead of calling an LLM API directly, it POSTs to the gateway's /api/v1/acp/prompt endpoint,
 which routes the request through ACP to an LLM-backed engine process.
 
+Before each ACP call, if a tool_executor is provided, the provider registers the tool
+execution context with the MCP server via HTTP (POST /mcp/{module}/context). The MCP server
+creates a live tool_executor closure from the received params. After the ACP call completes,
+the context is deregistered (DELETE /mcp/{module}/context). This works cross-process
+(deriver → FastAPI) and same-process (dialectic in FastAPI).
+
 Two call patterns:
   1. Non-agentic (deriver, summarizer): Send prompt text, get text response back.
      For deriver: parse response into PromptRepresentation.
@@ -15,6 +21,7 @@ Two call patterns:
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,28 +31,37 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Tool name mapping: Honcho internal → MCP tool names
+# HTTP context registration helpers — register/deregister tool execution
+# context with the MCP server before/after each ACP gateway call.
+# The MCP server (FastAPI process) creates a live tool_executor closure
+# from the received params. Works cross-process (deriver → FastAPI) and
+# same-process (dialectic in FastAPI).
 # ---------------------------------------------------------------------------
 
-TOOL_NAME_MAP: dict[str, str] = {
-    # Map Honcho internal tool names → Honcho canonical MCP tool names
-    # (matching the Python MCP server at src/mcp_server.py)
-    "search_memory": "query_conclusions",
-    "create_observations": "create_conclusions",
-    "delete_observations": "delete_conclusion",
-    "update_peer_card": "set_peer_card",
-    "get_reasoning_chain": "honcho_get_reasoning_chain",
-    "search_messages": "get_session_messages",
-    "grep_messages": "get_session_messages",
-    "get_recent_observations": "list_conclusions",
-    "get_most_derived_observations": "list_conclusions",
-    "get_observation_context": "query_conclusions",
-    "get_messages_by_date_range": "get_session_messages",
-    "search_messages_temporal": "get_session_messages",
-    "get_peer_card": "get_peer_card",
-    "finish_consolidation": "query_conclusions",
-    "extract_preferences": "get_session_messages",
-}
+_MCP_BASE_URL = "http://localhost:8000"
+
+
+async def _register_mcp_context(module: str, params: dict[str, Any]) -> None:
+    """POST serializable ToolContext params to the MCP server for a module."""
+    url = f"{_MCP_BASE_URL}/mcp/{module}/context"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            resp = await client.post(url, json=params)
+            if resp.status_code != 200:
+                logger.error(f"MCP context registration failed for {module}: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"MCP context registration failed for {module}: {e}")
+
+
+async def _deregister_mcp_context(module: str) -> None:
+    """DELETE tool execution context from the MCP server after ACP call completes."""
+    url = f"{_MCP_BASE_URL}/mcp/{module}/context"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            await client.delete(url)
+    except Exception as e:
+        logger.warning(f"MCP context deregistration failed for {module}: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Module detection from prompt content
@@ -127,8 +143,6 @@ def build_agentic_prompt(
         for tool in tools:
             name = tool.get("name", "")
             description = tool.get("description", "")
-            # Map Honcho internal tool name to MCP tool name
-            mcp_name = TOOL_NAME_MAP.get(name, name)
             input_schema = tool.get("input_schema", tool.get("parameters", {}))
             params_desc = ""
             if input_schema and "properties" in input_schema:
@@ -142,7 +156,7 @@ def build_agentic_prompt(
                     param_parts.append(f"    - {pname}{req_marker}: {pdesc}")
                 params_desc = "\n".join(param_parts)
 
-            tool_section += f"\n- {mcp_name}: {description}\n"
+            tool_section += f"\n- {name}: {description}\n"
             if params_desc:
                 tool_section += f"  Parameters:\n{params_desc}\n"
 
@@ -208,7 +222,8 @@ async def honcho_llm_call_inner_acp(
     json_mode: bool = False,
     tools: list[dict[str, Any]] | None = None,
     stream: bool = False,
-    timeout_ms: int = 120000,
+    timeout_ms: int = 300000,
+    tool_executor: Callable | None = None,
 ) -> Any:
     """
     Route an LLM call through an external ACP gateway's HTTP bridge.
@@ -273,6 +288,19 @@ async def honcho_llm_call_inner_acp(
 
     logger.info(f"ACP provider: sending {module} prompt to {bridge_url} (timeout={timeout_s}s)")
 
+    # Register tool execution context with the MCP server via HTTP.
+    # The MCP server creates a live tool_executor closure from the params.
+    if tool_executor is not None:
+        ctx = tool_executor._ctx  # ToolContext attached to closure
+        await _register_mcp_context(module, {
+            "workspace_name": ctx.workspace_name,
+            "observer": ctx.observer,
+            "observed": ctx.observed,
+            "session_name": ctx.session_name,
+            "include_observation_ids": ctx.include_observation_ids,
+            "history_token_limit": ctx.history_token_limit,
+        })
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
             response = await client.post(bridge_url, json=bridge_request)
@@ -291,6 +319,9 @@ async def honcho_llm_call_inner_acp(
     except httpx.ConnectError as e:
         logger.error(f"ACP bridge connection failed: {e}")
         raise RuntimeError(f"ACP bridge connection failed: {e}")
+    finally:
+        if tool_executor is not None:
+            await _deregister_mcp_context(module)
 
     logger.info(f"ACP provider: received {len(response_text)} chars from {module}")
 

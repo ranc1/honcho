@@ -19,7 +19,7 @@ This fork also fixes upstream bugs in the Conclusion API (`level` and `source_id
 | Env Var | Type | Default | Description |
 |---|---|---|---|
 | `LLM_ACP_GATEWAY_URL` | `str` | `None` | ACP gateway URL. Enables the ACP provider when set. |
-| `LLM_ACP_TIMEOUT_MS` | `int` | `120000` | Request timeout in ms (1–600000). |
+| `LLM_ACP_TIMEOUT_MS` | `int` | `300000` | Request timeout in ms (1–600000). |
 
 Set any module's provider to `acp` to route its LLM calls through the gateway:
 
@@ -66,7 +66,28 @@ Request:  { "module": "deriver"|"dreamer"|"dialectic"|"summarizer",
 Response: { "text": "..." }
 ```
 
-And provide MCP tools matching Honcho's canonical names: `query_conclusions`, `create_conclusions`, `delete_conclusion`, `set_peer_card`, `get_peer_card`, `list_conclusions`, `get_session_messages`, `chat`.
+The gateway registers per-module MCP server URLs when creating ACP sessions for Honcho modules (e.g., `http://{honcho_host}:8000/mcp/dreamer` for the dreamer session).
+
+## MCP Architecture
+
+This fork exposes two MCP servers:
+
+### Internal Tool MCP (port 8000, per-module endpoints)
+
+Serves Honcho's internal reasoning modules (dreamer, dialectic, deriver). Dispatches tools via `_TOOL_HANDLERS` using a `tool_executor` closure created during HTTP context registration.
+
+- **Endpoints**: `POST /mcp/{dreamer,dialectic,deriver}` (JSON-RPC)
+- **Context**: `POST /mcp/{module}/context` (register), `DELETE /mcp/{module}/context` (deregister)
+- **Tools (16)**: 15 internal tools auto-generated from `agent_tools.TOOLS` dict + `honcho_extract_facts`
+- **Tool names**: `create_observations`, `delete_observations`, `search_memory`, `search_messages`, `grep_messages`, `get_messages_by_date_range`, `search_messages_temporal`, `get_observation_context`, `get_recent_observations`, `get_most_derived_observations`, `get_peer_card`, `update_peer_card`, `finish_consolidation`, `extract_preferences`, `get_reasoning_chain`, `honcho_extract_facts`
+
+### Client-Facing TS MCP (port 8001)
+
+Serves external consumers (CLI engines, integrations). Reuses the upstream TypeScript MCP code with only the entry point changed from Cloudflare Workers to a self-hosted Node.js HTTP server.
+
+- **Endpoint**: `POST /` (Streamable HTTP transport with session management)
+- **Tools (30)**: All upstream tools including `query_conclusions`, `create_conclusions`, `chat`, `get_peer_card`, `get_session_messages`, `search`, etc.
+- **Config**: `MCP_WORKSPACE_ID`, `HONCHO_BASE_URL`, `HONCHO_API_KEY` env vars
 
 ## Local Development
 

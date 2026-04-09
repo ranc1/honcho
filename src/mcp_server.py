@@ -1,45 +1,75 @@
 """
 Python MCP Server for Honcho — runs inside the FastAPI process.
 
-Exposes 10 tools via JSON-RPC MCP protocol at POST /mcp:
+Exposes 16 tools via JSON-RPC MCP protocol at POST /mcp/{module}:
 
-  Conclusions: list_conclusions, query_conclusions, create_conclusions, delete_conclusion
-  Peers:       chat, get_peer_card, set_peer_card, get_peer_context
-  Custom:      honcho_get_reasoning_chain, honcho_extract_facts
+  15 internal tools auto-generated from agent_tools.TOOLS dict
+  + honcho_extract_facts (custom extraction store logic)
 
-Uses Honcho's REST API (localhost, same container) for all tool calls.
+Per-module endpoints: /mcp/dreamer, /mcp/dialectic, /mcp/deriver
+Each endpoint reads the tool_executor closure from _module_tool_executor for tool dispatch.
+
+Context registration: Before each ACP call, the calling process POSTs to
+/mcp/{module}/context with serializable params. The MCP server creates a live
+tool_executor closure via create_tool_executor() and stores it in _module_tool_executor.
+After the ACP call completes, DELETE /mcp/{module}/context removes it.
 
 The extraction store is a module-level variable. The deriver process
 reads it via GET /mcp/extraction (HTTP, cross-process).
 """
 
-import asyncio
 import json
 import logging
-import os
+from collections.abc import Callable
 from typing import Any
 
-import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from src.config import settings
-from src.utils.agent_tools import ToolContext, _TOOL_HANDLERS
+from src.utils.agent_tools import TOOLS, _TOOL_HANDLERS, create_tool_executor
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Valid Modules ────────────────────────────────────────────────────────────
 
-_HONCHO_BASE_URL = "http://localhost:8000"
-_WORKSPACE_ID = os.environ.get("MCP_WORKSPACE_ID") or settings.NAMESPACE or "default"
+_VALID_MODULES = ("dreamer", "dialectic", "deriver")
+
+# ─── Internal Tool Names ──────────────────────────────────────────────────────
+
+_INTERNAL_TOOL_NAMES = [
+    "create_observations",
+    "update_peer_card",
+    "search_memory",
+    "get_observation_context",
+    "search_messages",
+    "grep_messages",
+    "get_messages_by_date_range",
+    "search_messages_temporal",
+    "get_recent_observations",
+    "get_most_derived_observations",
+    "get_peer_card",
+    "delete_observations",
+    "finish_consolidation",
+    "extract_preferences",
+    "get_reasoning_chain",
+]
+
+# Startup assertions: fail fast if upstream removes a tool
+for _name in _INTERNAL_TOOL_NAMES:
+    assert _name in TOOLS, f"Internal tool '{_name}' not found in TOOLS dict"
+    assert _name in _TOOL_HANDLERS, f"Internal tool '{_name}' not found in _TOOL_HANDLERS"
 
 
-async def _api(method: str, path: str, **kwargs) -> httpx.Response:
-    """HTTP request to Honcho REST API."""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-        return await getattr(client, method)(f"{_HONCHO_BASE_URL}{path}", **kwargs)
+# ─── Per-Module Tool Executor Store ───────────────────────────────────────────
+# Keyed by module name ("dreamer", "dialectic", "deriver").
+# Set via POST /mcp/{module}/context before ACP gateway call,
+# read by dispatch_tool() during tool calls,
+# removed via DELETE /mcp/{module}/context after ACP call completes.
+# Safe because ACP gateway serializes per-module (concurrency-1 FIFO queue).
+
+_module_tool_executor: dict[str, Callable] = {}
 
 
 # ─── Extraction Store ─────────────────────────────────────────────────────────
@@ -70,270 +100,50 @@ def _error(msg: str) -> dict:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
 
 
-# ─── Tool Definitions (10 tools) ──────────────────────────────────────────────
+# ─── Tool Definitions (16 tools) ──────────────────────────────────────────────
 
+# Auto-generate MCP tool definitions from the TOOLS dict for 15 internal tools
 MCP_TOOL_DEFS: list[dict[str, Any]] = [
-    {
-        "name": "list_conclusions",
-        "description": "List conclusions (facts/observations) about a peer.",
-        "inputSchema": {"type": "object", "properties": {
-            "peer_id": {"type": "string", "description": "The observer peer."},
-            "target_peer_id": {"type": "string", "description": "Optional target peer."},
-        }, "required": ["peer_id"]},
-    },
-    {
-        "name": "query_conclusions",
-        "description": "Semantic search across conclusions ranked by relevance.",
-        "inputSchema": {"type": "object", "properties": {
-            "peer_id": {"type": "string", "description": "The observer peer."},
-            "query": {"type": "string", "description": "Semantic search query."},
-            "target_peer_id": {"type": "string", "description": "Optional target peer."},
-            "top_k": {"type": "number", "description": "Max results (default: 5)."},
-        }, "required": ["peer_id", "query"]},
-    },
-    {
-        "name": "create_conclusions",
-        "description": "Create conclusions (facts/observations) about a peer.",
-        "inputSchema": {"type": "object", "properties": {
-            "peer_id": {"type": "string", "description": "The observer peer."},
-            "target_peer_id": {"type": "string", "description": "The peer the conclusions are about."},
-            "conclusions": {"type": "array", "items": {"type": "string"}, "description": "Conclusion content strings."},
-            "session_id": {"type": "string", "description": "Optional session ID."},
-        }, "required": ["peer_id", "target_peer_id", "conclusions"]},
-    },
-    {
-        "name": "delete_conclusion",
-        "description": "Delete a specific conclusion by ID.",
-        "inputSchema": {"type": "object", "properties": {
-            "peer_id": {"type": "string", "description": "The observer peer."},
-            "target_peer_id": {"type": "string", "description": "The target peer."},
-            "conclusion_id": {"type": "string", "description": "The conclusion to delete."},
-        }, "required": ["peer_id", "target_peer_id", "conclusion_id"]},
-    },
-    {
-        "name": "chat",
-        "description": "Ask Honcho a question about a peer using the reasoning system.",
-        "inputSchema": {"type": "object", "properties": {
-            "peer_id": {"type": "string", "description": "The peer to query about."},
-            "query": {"type": "string", "description": "Natural-language question."},
-            "target_peer_id": {"type": "string", "description": "Optional target peer."},
-            "reasoning_level": {"type": "string", "description": "'minimal','low','medium','high','max'"},
-        }, "required": ["peer_id", "query"]},
-    },
-    {
-        "name": "get_peer_card",
-        "description": "Get the peer card — compact biographical facts about a peer.",
-        "inputSchema": {"type": "object", "properties": {
-            "peer_id": {"type": "string", "description": "The observer peer."},
-            "target_peer_id": {"type": "string", "description": "Optional target peer."},
-        }, "required": ["peer_id"]},
-    },
-    {
-        "name": "set_peer_card",
-        "description": "Set or update the peer card for a peer.",
-        "inputSchema": {"type": "object", "properties": {
-            "peer_id": {"type": "string", "description": "The observer peer."},
-            "peer_card": {"type": "array", "items": {"type": "string"}, "description": "Fact strings."},
-            "target_peer_id": {"type": "string", "description": "Optional target peer."},
-        }, "required": ["peer_id", "peer_card"]},
-    },
-    {
-        "name": "get_peer_context",
-        "description": "Get comprehensive context for a peer — representation + peer card.",
-        "inputSchema": {"type": "object", "properties": {
-            "peer_id": {"type": "string", "description": "The observer peer."},
-            "target_peer_id": {"type": "string", "description": "Optional target peer."},
-            "search_query": {"type": "string", "description": "Optional semantic search to filter conclusions."},
-            "max_conclusions": {"type": "number", "description": "Max conclusions to include."},
-        }, "required": ["peer_id"]},
-    },
-    {
-        "name": "honcho_get_reasoning_chain",
-        "description": "Traverse the reasoning chain for a conclusion by following source_ids recursively.",
-        "inputSchema": {"type": "object", "properties": {
-            "conclusion_id": {"type": "string", "description": "The conclusion ID to start from."},
-            "direction": {"type": "string", "description": "'premises', 'conclusions', or 'both' (default: 'both')."},
-        }, "required": ["conclusion_id"]},
-    },
-    {
-        "name": "honcho_extract_facts",
-        "description": "Submit extracted facts from conversation messages. Call this with the observations you extracted.",
-        "inputSchema": {"type": "object", "properties": {
-            "explicit": {
-                "type": "array", "description": "Array of explicit observations",
-                "items": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]},
-            },
-        }, "required": ["explicit"]},
-    },
+    {"name": t["name"], "description": t["description"], "inputSchema": t["input_schema"]}
+    for name in _INTERNAL_TOOL_NAMES
+    for t in [TOOLS[name]]
 ]
+
+# Append honcho_extract_facts manually (16th tool, custom logic)
+MCP_TOOL_DEFS.append({
+    "name": "honcho_extract_facts",
+    "description": "Submit extracted facts from conversation messages. Call this with the observations you extracted.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "explicit": {
+                "type": "array",
+                "description": "Array of explicit observations",
+                "items": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                    "required": ["content"],
+                },
+            },
+        },
+        "required": ["explicit"],
+    },
+})
 
 
 # ─── Tool Dispatch ────────────────────────────────────────────────────────────
 
-async def dispatch_tool(name: str, args: dict[str, Any]) -> dict:
-    """Dispatch a tool call to the Honcho REST API."""
+async def dispatch_tool(name: str, args: dict[str, Any], module: str) -> dict:
+    """Dispatch a tool call to the appropriate handler."""
     try:
-        wid = _WORKSPACE_ID
-
-        if name == "list_conclusions":
-            peer_id = args["peer_id"]
-            target = args.get("target_peer_id")
-            # POST /v3/workspaces/{wid}/conclusions/list with optional filters
-            filters: dict[str, Any] = {"observer_id": peer_id}
-            if target:
-                filters["observed_id"] = target
-            resp = await _api("post", f"/v3/workspaces/{wid}/conclusions/list",
-                              json={"filters": filters})
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items", [])
-            return _text([{
-                "id": c.get("id"), "content": c.get("content"),
-                "observer_id": c.get("observer_id"), "observed_id": c.get("observed_id"),
-                "created_at": c.get("created_at"),
-            } for c in items])
-
-        if name == "query_conclusions":
-            peer_id = args["peer_id"]
-            query = args["query"]
-            target = args.get("target_peer_id")
-            top_k = args.get("top_k")
-            # POST /v3/workspaces/{wid}/conclusions/query
-            body: dict[str, Any] = {"query": query}
-            if top_k is not None:
-                body["top_k"] = int(top_k)
-            filters: dict[str, Any] = {"observer_id": peer_id}
-            if target:
-                filters["observed_id"] = target
-            body["filters"] = filters
-            resp = await _api("post", f"/v3/workspaces/{wid}/conclusions/query", json=body)
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items", []) if isinstance(data, dict) else []
-            return _text([{
-                "id": c.get("id"), "content": c.get("content"),
-                "observer_id": c.get("observer_id"), "observed_id": c.get("observed_id"),
-                "created_at": c.get("created_at"),
-            } for c in items])
-
-        if name == "create_conclusions":
-            peer_id = args["peer_id"]
-            target = args["target_peer_id"]
-            conclusions = args["conclusions"]
-            session_id = args.get("session_id")
-            # POST /v3/workspaces/{wid}/conclusions
-            body_items = []
-            for c in conclusions:
-                item: dict[str, Any] = {
-                    "content": c,
-                    "observer_id": peer_id,
-                    "observed_id": target,
-                }
-                if session_id:
-                    item["session_id"] = session_id
-                body_items.append(item)
-            resp = await _api("post", f"/v3/workspaces/{wid}/conclusions",
-                              json={"conclusions": body_items})
-            resp.raise_for_status()
-            return _text(f"Created {len(conclusions)} conclusion(s)")
-
-        if name == "delete_conclusion":
-            conclusion_id = args["conclusion_id"]
-            # DELETE /v3/workspaces/{wid}/conclusions/{id}
-            resp = await _api("delete", f"/v3/workspaces/{wid}/conclusions/{conclusion_id}")
-            resp.raise_for_status()
-            return _text("Conclusion deleted")
-
-        if name == "chat":
-            peer_id = args["peer_id"]
-            query = args["query"]
-            target = args.get("target_peer_id")
-            reasoning_level = args.get("reasoning_level")
-            # POST /v3/workspaces/{wid}/peers/{pid}/chat
-            body: dict[str, Any] = {"query": query}
-            if target:
-                body["target"] = target
-            if reasoning_level:
-                body["reasoning_level"] = reasoning_level
-            resp = await _api("post", f"/v3/workspaces/{wid}/peers/{peer_id}/chat", json=body)
-            resp.raise_for_status()
-            data = resp.json()
-            return _text(data if isinstance(data, str) else data.get("content", data))
-
-        if name == "get_peer_card":
-            peer_id = args["peer_id"]
-            target = args.get("target_peer_id")
-            # GET /v3/workspaces/{wid}/peers/{pid}/card?target=...
-            params: dict[str, str] = {}
-            if target:
-                params["target"] = target
-            resp = await _api("get", f"/v3/workspaces/{wid}/peers/{peer_id}/card", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            return _text(data if data else "No peer card found.")
-
-        if name == "set_peer_card":
-            peer_id = args["peer_id"]
-            peer_card = args["peer_card"]
-            target = args.get("target_peer_id")
-            # PUT /v3/workspaces/{wid}/peers/{pid}/card?target=...
-            params: dict[str, str] = {}
-            if target:
-                params["target"] = target
-            resp = await _api("put", f"/v3/workspaces/{wid}/peers/{peer_id}/card",
-                              params=params, json={"peer_card": peer_card})
-            resp.raise_for_status()
-            return _text("Peer card updated")
-
-        if name == "get_peer_context":
-            peer_id = args["peer_id"]
-            target = args.get("target_peer_id")
-            search_query = args.get("search_query")
-            max_conclusions = args.get("max_conclusions")
-            # GET /v3/workspaces/{wid}/peers/{pid}/context?target=...&search_query=...
-            params: dict[str, str] = {}
-            if target:
-                params["target"] = target
-            if search_query:
-                params["search_query"] = search_query
-            if max_conclusions is not None:
-                params["max_conclusions"] = str(max_conclusions)
-            resp = await _api("get", f"/v3/workspaces/{wid}/peers/{peer_id}/context", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            return _text({
-                "peer_id": data.get("peer_id"),
-                "target_id": data.get("target_id"),
-                "representation": data.get("representation"),
-                "peer_card": data.get("peer_card"),
-            })
-
-        if name == "honcho_get_reasoning_chain":
-            # Reuse Honcho's internal _handle_get_reasoning_chain directly (same process)
-            handler = _TOOL_HANDLERS.get("get_reasoning_chain")
-            if not handler:
-                return _error("get_reasoning_chain handler not found")
-            ctx = ToolContext(
-                workspace_name=wid,
-                observer="agent-main-default",
-                observed="agent-main-default",
-                session_name=None,
-                current_messages=None,
-                include_observation_ids=True,
-                history_token_limit=10000,
-                db_lock=asyncio.Lock(),
-                configuration=None,
-            )
-            tool_input = {
-                "observation_id": args["conclusion_id"],
-                "direction": args.get("direction", "both"),
-            }
-            try:
-                result = await handler(ctx, tool_input)
-                return _text(result)
-            except Exception as e:
-                logger.error(f"get_reasoning_chain failed: {e}")
-                return _error(str(e))
+        if name in _TOOL_HANDLERS:
+            tool_executor = _module_tool_executor.get(module)
+            if tool_executor is None:
+                return _error(
+                    f"No tool executor for module '{module}' — tool called outside ACP flow"
+                )
+            result = await tool_executor(name, args)
+            return _text(result)
 
         if name == "honcho_extract_facts":
             explicit = args.get("explicit", [])
@@ -344,18 +154,71 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> dict:
 
         return _error(f"Unknown tool: {name}")
 
-    except httpx.HTTPStatusError as e:
-        return _error(f"HTTP {e.response.status_code}: {e.response.text[:200]}")
     except Exception as e:
         logger.error(f"Tool {name} failed: {e}")
         return _error(str(e))
 
 
-# ─── MCP JSON-RPC Endpoint ────────────────────────────────────────────────────
+# ─── Context Registration Endpoints ──────────────────────────────────────────
 
-@router.post("/mcp")
-async def mcp_endpoint(request: Request) -> JSONResponse:
-    """Handle MCP JSON-RPC requests."""
+@router.post("/mcp/{module}/context")
+async def register_context(request: Request, module: str) -> JSONResponse:
+    """Register tool execution context for a module before ACP call.
+
+    Receives serializable params, calls create_tool_executor() to build a live
+    closure in this process, and stores it in _module_tool_executor[module].
+    """
+    if module not in _VALID_MODULES:
+        return JSONResponse(
+            status_code=404, content={"error": f"Unknown module: {module}"}
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "Invalid JSON body"}
+        )
+
+    try:
+        tool_executor = await create_tool_executor(
+            workspace_name=body["workspace_name"],
+            observer=body["observer"],
+            observed=body["observed"],
+            session_name=body.get("session_name"),
+            include_observation_ids=body.get("include_observation_ids", True),
+            history_token_limit=body.get("history_token_limit", 10000),
+        )
+        _module_tool_executor[module] = tool_executor
+        return JSONResponse({"status": "ok"})
+    except KeyError as e:
+        return JSONResponse(
+            status_code=400, content={"error": f"Missing required field: {e}"}
+        )
+    except Exception as e:
+        logger.error(f"Failed to create tool executor for {module}: {e}")
+        return JSONResponse(
+            status_code=500, content={"error": str(e)}
+        )
+
+
+@router.delete("/mcp/{module}/context")
+async def deregister_context(request: Request, module: str) -> JSONResponse:
+    """Remove tool execution context after ACP call completes."""
+    _module_tool_executor.pop(module, None)
+    return JSONResponse({"status": "ok"})
+
+
+# ─── Per-Module MCP JSON-RPC Endpoint ─────────────────────────────────────────
+
+@router.post("/mcp/{module}")
+async def mcp_module_endpoint(request: Request, module: str) -> JSONResponse:
+    """Handle MCP JSON-RPC requests for a specific module (dreamer, dialectic, deriver)."""
+    if module not in _VALID_MODULES:
+        return JSONResponse(
+            status_code=404, content={"error": f"Unknown module: {module}"}
+        )
+
     try:
         msg = await request.json()
     except Exception:
@@ -393,7 +256,7 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
         if not tool_name:
             return JSONResponse({"jsonrpc": "2.0", "id": msg_id,
                 "error": {"code": -32602, "message": "Missing tool name"}})
-        result = await dispatch_tool(tool_name, tool_args)
+        result = await dispatch_tool(tool_name, tool_args, module)
         return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": result})
 
     return JSONResponse({"jsonrpc": "2.0", "id": msg_id,

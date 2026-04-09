@@ -6,7 +6,7 @@ This feature adds an ACP (Agent Client Protocol) provider to Honcho that routes 
 
 The ACP provider intercepts at the provider dispatch level (`honcho_llm_call_inner`), so all existing reasoning modules (deriver, dreamer, dialectic, summarizer) work without modification. For agentic calls (dreamer, dialectic), Honcho's internal `_execute_tool_loop` is bypassed — the ACP provider constructs a combined prompt with tool instructions, and the gateway engine's native tool-calling loop handles MCP tool execution.
 
-The fork also includes a Python MCP server (running inside the FastAPI process), fixes upstream bugs in the Conclusion API, and configures embeddings for a local open-source model.
+The fork also includes two MCP servers (an internal Python MCP for Honcho's reasoning modules and a client-facing TypeScript MCP for external consumers), fixes upstream bugs in the Conclusion API, and configures embeddings for a local open-source model.
 
 ## Components and Interfaces
 
@@ -19,7 +19,7 @@ The fork also includes a Python MCP server (running inside the FastAPI process),
 | Setting | Env Var | Type | Default | Description |
 |---|---|---|---|---|
 | `ACP_GATEWAY_URL` | `LLM_ACP_GATEWAY_URL` | `str \| None` | `None` | Gateway bridge URL. Enables ACP provider when set. |
-| `ACP_TIMEOUT_MS` | `LLM_ACP_TIMEOUT_MS` | `int` | `120000` | Request timeout (ms). Range: 1–600000. |
+| `ACP_TIMEOUT_MS` | `LLM_ACP_TIMEOUT_MS` | `int` | `300000` | Request timeout (ms). Range: 1–600000. |
 
 ### 2. Client Registration and Dispatch
 
@@ -69,31 +69,21 @@ Keywords per module:
 1. `build_agentic_prompt(messages, tools)` constructs combined prompt:
    - `[System Instructions]` — from system messages
    - `[Task]` — from user messages
-   - `[Available Tools]` — each tool with mapped MCP name, description, parameters
-2. Tool names mapped via `TOOL_NAME_MAP`
-3. POST `{ module, prompt }` to bridge (no separate systemPrompt)
-4. Return raw text (engine handles tool calling via MCP)
+   - `[Available Tools]` — each tool with internal name, description, parameters (no name mapping)
+2. Tool names pass through as-is (internal names match MCP tool names)
+3. Before the bridge call, if `tool_executor` is provided, register context with the MCP server via `POST /mcp/{module}/context` (sends serializable `ToolContext` fields extracted from `tool_executor._ctx`)
+4. POST `{ module, prompt }` to bridge (no separate systemPrompt)
+5. Engine handles tool calling via per-module MCP endpoints
+6. After bridge returns (in `finally` block), deregister context via `DELETE /mcp/{module}/context`
+7. Return raw text
 
 #### Tool Name Mapping
 
-`TOOL_NAME_MAP` maps Honcho internal names → canonical MCP names:
+`TOOL_NAME_MAP` has been removed. MCP tool names now match Honcho's internal tool names directly. The `build_agentic_prompt()` function passes tool names through as-is. See `.kiro/specs/mcp-internal-tools-migration/design.md` for the full migration design.
 
-| Honcho Internal | Canonical MCP Name |
-|---|---|
-| `search_memory` | `query_conclusions` |
-| `create_observations` | `create_conclusions` |
-| `delete_observations` | `delete_conclusion` |
-| `update_peer_card` | `set_peer_card` |
-| `get_reasoning_chain` | `honcho_get_reasoning_chain` (custom) |
-| `search_messages` / `grep_messages` | `get_session_messages` |
-| `get_recent_observations` / `get_most_derived_observations` | `list_conclusions` |
-| `get_observation_context` / `finish_consolidation` | `query_conclusions` |
-| `get_peer_card` | `get_peer_card` |
-| `extract_preferences` / `get_messages_by_date_range` / `search_messages_temporal` | `get_session_messages` |
-
-Two custom names have no upstream equivalent:
-- `honcho_get_reasoning_chain` — reasoning chain traversal, reuses Honcho's internal `_handle_get_reasoning_chain` handler directly (same process, direct DB access via `tracked_db()`)
+Two custom tools have no upstream equivalent:
 - `honcho_extract_facts` — structured deriver output via extraction store (workaround for ACP's inability to enforce structured output schemas)
+- `get_reasoning_chain` — reasoning chain traversal, dispatched via `tool_executor` closure which calls `_TOOL_HANDLERS["get_reasoning_chain"]` internally
 
 #### Deriver Response Parsing
 
@@ -139,88 +129,95 @@ Fixed `create_observations()` in `src/crud/document.py`:
 - Vector dimensions: `Vector(1536)` → `Vector(1024)` in `MessageEmbedding` and `Document` models
 - Migration scripts updated: `Vector(1536)` → `Vector(1024)` in `a1b2c3d4e5f6_initial_schema.py`, `917195d9b5e9_add_messageembedding_table.py`, and `119a52b73c60_support_external_embeddings.py`
 
-### 6. Python MCP Server
+### 6. MCP Servers
 
-**File:** `src/mcp_server.py` (new, ~280 LOC)
+Two MCP servers run inside the Honcho Docker container:
 
-A Python MCP server implemented as a FastAPI router, mounted on the main Honcho FastAPI app at `/mcp`. Runs in the same process as the Honcho API server. Exposes 10 tools matching the canonical MCP tool names.
+#### Internal Tool MCP (Python, port 8000)
 
-**Why Python, not TypeScript:** The original upstream MCP was a Cloudflare Workers TypeScript app. We migrated it to Python running inside the FastAPI process. Benefits:
-1. No Node.js in the Docker image — pure Python container
-2. `honcho_get_reasoning_chain` reuses Honcho's internal `_handle_get_reasoning_chain` handler directly (same process, direct DB access)
-3. `honcho_extract_facts` stores results in a module-level variable accessible via `GET /mcp/extraction` for the deriver process
+**File:** `src/mcp_server.py`
 
-**Tools (10):**
+A Python MCP server implemented as a FastAPI router, mounted on the main Honcho FastAPI app. Runs in the same process as the Honcho API server. Exposes 16 tools matching Honcho's internal tool names, auto-generated from the `TOOLS` dict in `agent_tools.py`.
 
-8 standard tools expose Honcho's REST API to the CLI engine. 2 custom tools fill gaps created by the ACP architecture.
+Per-module endpoints (`POST /mcp/{dreamer,dialectic,deriver}`) allow the MCP server to identify which module is calling. Before each ACP call, the calling process registers tool execution context via `POST /mcp/{module}/context` with serializable `ToolContext` fields. The MCP server creates a live `tool_executor` closure via `create_tool_executor()` and stores it. Tool dispatch calls the stored closure directly.
 
-| Tool | Implementation | Used By | Description |
-|---|---|---|---|
-| `list_conclusions` | `POST /conclusions/list` with `observer_id`/`observed_id` filters | Dreamer | List observations for consolidation |
-| `query_conclusions` | `POST /conclusions/query` with filters | Dreamer, Dialectic | Semantic search over observations |
-| `create_conclusions` | `POST /conclusions` with `observer_id`/`observed_id` in body | Dreamer | Create deductive/inductive observations during consolidation |
-| `delete_conclusion` | `DELETE /conclusions/{id}` | Dreamer | Remove redundant/outdated observations during consolidation |
-| `chat` | `POST /peers/{pid}/chat` | Dialectic | Trigger dialectic reasoning query |
-| `get_peer_card` | `GET /peers/{pid}/card?target=...` | Dreamer, Dialectic | Read biographical facts |
-| `set_peer_card` | `PUT /peers/{pid}/card?target=...` | Dreamer | Update biographical facts during consolidation |
-| `get_peer_context` | `GET /peers/{pid}/context?target=...&search_query=...` | Dialectic | Combined representation + peer card retrieval |
-| `honcho_get_reasoning_chain` | Internal `_handle_get_reasoning_chain` (direct DB) | Dreamer | Traverse observation source chains (custom) |
-| `honcho_extract_facts` | Module-level extraction store | Deriver | Structured fact extraction output (custom) |
+**Tools (16):**
+
+15 internal tools dispatched via stored `tool_executor` closure + 1 custom tool:
+
+| Tool | Used By | Description |
+|---|---|---|
+| `create_observations` | Dreamer | Create observations at any level (explicit, deductive, inductive, contradiction) |
+| `delete_observations` | Dreamer | Batch delete observations by ID |
+| `update_peer_card` | Dreamer | Set/update peer card biographical facts |
+| `search_memory` | Dreamer, Dialectic | Semantic search across observations |
+| `get_observation_context` | Dreamer, Dialectic | Retrieve messages by message IDs with surrounding context |
+| `search_messages` | Dreamer, Dialectic | Semantic search across messages with conversation snippets |
+| `grep_messages` | Dialectic | Exact text search across messages |
+| `get_messages_by_date_range` | Dialectic | Temporal message retrieval |
+| `search_messages_temporal` | Dialectic | Semantic search with date filtering |
+| `get_recent_observations` | Dreamer | Most recent observations |
+| `get_most_derived_observations` | Dreamer | Most frequently reinforced observations |
+| `get_peer_card` | Dreamer, Dialectic | Read peer card biographical facts |
+| `finish_consolidation` | Dreamer | Signal dreamer consolidation complete |
+| `extract_preferences` | Dreamer | Extract preferences from conversation history |
+| `get_reasoning_chain` | Dreamer, Dialectic | Traverse observation reasoning chains |
+| `honcho_extract_facts` | Deriver | Structured fact extraction output (custom, extraction store) |
+
+**Endpoints:**
+- `POST /mcp/{module}` — JSON-RPC 2.0 MCP protocol (initialize, tools/list, tools/call)
+- `POST /mcp/{module}/context` — Register tool execution context before ACP call
+- `DELETE /mcp/{module}/context` — Deregister context after ACP call
+- `GET /mcp/health` — Health check
+- `GET /mcp/extraction` — Pop extraction result (single slot, consumed on read)
+
+#### Client-Facing TS MCP (TypeScript/Node.js, port 8001)
+
+**Directory:** `mcp/`
+
+The upstream TypeScript MCP restored from the `main` branch, with only the entry point changed from Cloudflare Workers to a self-hosted Node.js HTTP server using `@modelcontextprotocol/sdk`'s `StreamableHTTPServerTransport`. All tool implementations (`mcp/src/tools/*.ts`) are reused as-is.
+
+Serves external consumers (CLI engines during normal user conversations, integrations). Uses `@honcho-ai/sdk` to call Honcho's REST API — no shared memory or direct DB access.
+
+**Tools (30):** All upstream tools including `query_conclusions`, `create_conclusions`, `chat`, `get_peer_card`, `get_session_messages`, `search`, `schedule_dream`, etc.
+
+**Config:** `MCP_WORKSPACE_ID`, `HONCHO_BASE_URL`, `HONCHO_API_KEY` env vars.
 
 #### Custom Tool: `honcho_extract_facts`
 
-**Why it exists:** In standard Honcho, the deriver calls an LLM with `response_model=PromptRepresentation` to get structured JSON output (a list of explicit observations). With the ACP provider, LLM calls are routed through the gateway's CLI engine, which cannot enforce structured output schemas. The deriver prompt instructs the CLI engine to call `honcho_extract_facts` with the extracted facts instead of outputting raw JSON. This tool writes the structured result to an in-memory extraction store. After the bridge returns, the deriver reads the result via `GET /mcp/extraction`.
+**Why it exists:** In standard Honcho, the deriver calls an LLM with `response_model=PromptRepresentation` to get structured JSON output. With the ACP provider, LLM calls are routed through the gateway's CLI engine, which cannot enforce structured output schemas. The deriver prompt instructs the CLI engine to call `honcho_extract_facts` with the extracted facts instead of outputting raw JSON. This tool writes the structured result to an in-memory extraction store. After the bridge returns, the deriver reads the result via `GET /mcp/extraction`.
 
-**Used by:** Deriver module (non-agentic path). The ACP provider appends this instruction to every deriver prompt: "You MUST submit your extracted facts by calling the honcho_extract_facts tool."
-
-**Fallback:** If the CLI engine doesn't call the tool (unreliable tool-calling), the deriver falls back to parsing the raw text response as JSON. If that also fails, extraction is skipped for that turn — messages remain in Honcho and will be reprocessed on the next deriver run.
-
-#### Custom Tool: `honcho_get_reasoning_chain`
-
-**Why it exists:** In standard Honcho, the dreamer agent calls `get_reasoning_chain` as an internal tool during its `_execute_tool_loop`. With the ACP provider, the dreamer's tool loop is bypassed — the ACP provider constructs a combined prompt with `[Available Tools]` and the CLI engine handles tool calling via MCP. The CLI engine needs an MCP-accessible version of this tool.
-
-**Used by:** Dreamer module (agentic path). During consolidation, the dreamer traverses observation source chains to understand how deductive/inductive observations were derived before deciding whether to consolidate or delete them.
-
-**Implementation:** Reuses Honcho's internal `_handle_get_reasoning_chain` handler directly (same FastAPI process, direct DB access via `tracked_db()`). Supports `direction` parameter (`premises`, `conclusions`, `both`). Returns formatted markdown with observation content, premises/sources, and derived conclusions.
-
-**Workspace ID:** Configured via `MCP_WORKSPACE_ID` env var (set in docker-compose), falling back to `settings.NAMESPACE`.
-
-**Endpoints:**
-- `POST /mcp` — JSON-RPC 2.0 MCP protocol (initialize, tools/list, tools/call)
-- `GET /mcp/health` — Health check
-- `GET /mcp/extraction` — Pop extraction result (single slot, consumed on read, used by deriver process)
-
-**Extraction store:** Module-level `_extraction_result: str | None`. `store_extraction_result(json)` writes, `pop_extraction_result()` reads and clears. The deriver process (separate Python process in the same container) reads via `GET /mcp/extraction`.
-
-**JSON-RPC protocol:** Uses protocol version `2024-11-05`, matching kiro-cli's expected format. Simple JSON-RPC request/response — no Streamable HTTP transport (kiro-cli doesn't support it).
+**Fallback:** If the CLI engine doesn't call the tool, the deriver falls back to parsing the raw text response as JSON. If that also fails, extraction is skipped for that turn.
 
 ## Fork Surface
 
-~400 LOC across 8+ files:
-
-| File | LOC Changed | Category |
-|---|---|---|
-| `src/utils/acp_provider.py` | ~300 (new) | ACP Provider |
-| `src/mcp_server.py` | ~280 (new) | Python MCP Server |
-| `src/utils/clients.py` | ~35 | ACP Provider |
-| `src/config.py` | ~3 | ACP Provider |
-| `src/utils/types.py` | ~2 | ACP Provider |
-| `src/main.py` | ~2 | MCP router mount |
-| `src/schemas/api.py` | ~4 | Schema Fix |
-| `src/crud/document.py` | ~7 | Schema Fix |
-| `src/embedding_client.py` | ~2 | Embedding Config |
-| `src/models.py` | ~4 | Embedding Config |
-| `migrations/versions/*.py` | ~4 | Migration Fix (Vector 1536→1024) |
-| `Dockerfile` | ~0 | Pure Python (no Node.js) |
-
-The `mcp/` directory contains the original upstream TypeScript MCP server files (retained for reference) but they are not used at runtime. The Python MCP server in `src/mcp_server.py` replaces them entirely.
+| File | Category |
+|---|---|
+| `src/utils/acp_provider.py` | ACP Provider (HTTP context registration, prompt construction) |
+| `src/mcp_server.py` | Internal Tool MCP (16 tools, per-module endpoints, context registration) |
+| `src/utils/clients.py` | ACP Provider (tool_executor threading) |
+| `src/utils/agent_tools.py` | Core (1 line: attach `_ctx` to tool_executor closure) |
+| `src/config.py` | ACP Provider (ACP_GATEWAY_URL, ACP_TIMEOUT_MS settings) |
+| `src/utils/types.py` | ACP Provider ("acp" added to SupportedProviders) |
+| `src/main.py` | MCP router mount |
+| `src/schemas/api.py` | Schema Fix (level, source_ids on Conclusion) |
+| `src/crud/document.py` | Schema Fix (level, source_ids in create_observations) |
+| `src/embedding_client.py` | Embedding Config (qwen3-embedding:0.6b) |
+| `src/models.py` | Embedding Config (Vector 1536→1024) |
+| `migrations/versions/*.py` | Migration Fix (Vector 1536→1024) |
+| `mcp/src/index.ts` | Client-Facing TS MCP (Node.js entry point) |
+| `mcp/src/config.ts` | Client-Facing TS MCP (env var config) |
+| `mcp/src/server.ts`, `mcp/src/tools/*.ts` | Client-Facing TS MCP (reused from upstream as-is) |
+| `Dockerfile` | Node.js build stage for TS MCP |
+| `docker/entrypoint.sh` | Start TS MCP + deriver + FastAPI |
+| `tests/test_mcp_*.py` | MCP migration tests |
 
 ## ACP Gateway Requirements
 
 The ACP gateway must:
 1. Expose `POST /api/v1/acp/prompt` accepting `{ module, prompt, systemPrompt? }` and returning `{ text }` (raw text — bridge is a dumb pipe)
-2. Register the Honcho MCP server (running inside the Honcho FastAPI process at `http://{honcho_host}:8000/mcp`) as an MCP server with the CLI engine at session creation
-3. The Honcho MCP server provides 10 tools: `list_conclusions`, `query_conclusions`, `create_conclusions`, `delete_conclusion`, `chat`, `get_peer_card`, `set_peer_card`, `get_peer_context`, `honcho_get_reasoning_chain`, `honcho_extract_facts`
+2. Register per-module MCP server URLs when creating ACP sessions for Honcho modules (e.g., `http://{honcho_host}:8000/mcp/dreamer` for the dreamer session, `http://{honcho_host}:8000/mcp/deriver` for the deriver session)
+3. The internal MCP server provides 16 tools matching Honcho's internal tool names (see Section 6)
 
 ## Error Handling
 

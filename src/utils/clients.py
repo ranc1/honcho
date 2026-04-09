@@ -769,6 +769,7 @@ async def _execute_tool_loop(
                 converted_tools,
                 effective_tool_choice,
                 conversation_messages,
+                tool_executor=tool_executor,
             )
 
         # Apply retry if enabled
@@ -1447,6 +1448,7 @@ async def honcho_llm_call(
                 True,  # type: ignore[arg-type]
                 converted_tools,
                 tool_choice,
+                tool_executor=tool_executor,
             )
         else:
             return await honcho_llm_call_inner(
@@ -1464,6 +1466,7 @@ async def honcho_llm_call(
                 False,  # type: ignore[arg-type]
                 converted_tools,
                 tool_choice,
+                tool_executor=tool_executor,
             )
 
     decorated = _call_with_provider_selection
@@ -1586,6 +1589,7 @@ async def honcho_llm_call_inner(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     messages: list[dict[str, Any]] | None = None,
+    tool_executor: Callable[[str, dict[str, Any]], Any] | None = None,
 ) -> HonchoLLMCallResponse[M]: ...
 
 
@@ -1607,6 +1611,7 @@ async def honcho_llm_call_inner(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     messages: list[dict[str, Any]] | None = None,
+    tool_executor: Callable[[str, dict[str, Any]], Any] | None = None,
 ) -> HonchoLLMCallResponse[str]: ...
 
 
@@ -1628,6 +1633,7 @@ async def honcho_llm_call_inner(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     messages: list[dict[str, Any]] | None = None,
+    tool_executor: Callable[[str, dict[str, Any]], Any] | None = None,
 ) -> AsyncIterator[HonchoLLMCallStreamChunk]: ...
 
 
@@ -1648,6 +1654,7 @@ async def honcho_llm_call_inner(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     messages: list[dict[str, Any]] | None = None,
+    tool_executor: Callable[[str, dict[str, Any]], Any] | None = None,
 ) -> HonchoLLMCallResponse[Any] | AsyncIterator[HonchoLLMCallStreamChunk]:
     # has already been validated by honcho_llm_call
     client = CLIENTS[provider]
@@ -1676,6 +1683,7 @@ async def honcho_llm_call_inner(
             response_model,
             reasoning_effort,
             verbosity,
+            tool_executor=tool_executor,
         )
 
     # Remove stream parameter for non-streaming calls as some providers don't accept it
@@ -1697,6 +1705,7 @@ async def honcho_llm_call_inner(
             tools=tools,
             stream=stream,
             timeout_ms=settings.LLM.ACP_TIMEOUT_MS,
+            tool_executor=tool_executor,
         )
     match client:
         case AsyncAnthropic():
@@ -2370,6 +2379,7 @@ async def handle_streaming_response(
     response_model: type[BaseModel] | None = None,
     reasoning_effort: Literal["low", "medium", "high", "minimal"] | None = None,
     verbosity: Literal["low", "medium", "high"] | None = None,
+    tool_executor: Callable[[str, dict[str, Any]], Any] | None = None,
 ) -> AsyncIterator[HonchoLLMCallStreamChunk]:
     """
     Handle streaming responses for all supported providers.
@@ -2382,6 +2392,7 @@ async def handle_streaming_response(
         response_model: Pydantic model for structured output
         reasoning_effort: OpenAI reasoning effort level (GPT-5 only)
         verbosity: OpenAI verbosity level (GPT-5 only)
+        tool_executor: Optional tool executor closure for ACP provider
 
     Yields:
         HonchoLLMCallStreamChunk: Individual chunks of the streaming response
@@ -2399,6 +2410,7 @@ async def handle_streaming_response(
             tools=tools,
             stream=False,
             timeout_ms=settings.LLM.ACP_TIMEOUT_MS,
+            tool_executor=tool_executor,
         )
         _text = _acp_result.content if isinstance(_acp_result.content, str) else str(_acp_result.content)
         yield HonchoLLMCallStreamChunk(content=_text, is_done=True, finish_reasons=["stop"])

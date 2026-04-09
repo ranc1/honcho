@@ -12,3 +12,5 @@ docker-compose.yml.example
 .vscode/**
 data/**
 .venv
+mcp/node_modules
+mcp/dist

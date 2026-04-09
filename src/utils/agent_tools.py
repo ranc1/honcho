@@ -1915,4 +1915,5 @@ async def create_tool_executor(
             # handles rollback in its finally block
             return error_msg
 
+    execute_tool._ctx = ctx  # type: ignore[attr-defined]
     return execute_tool
