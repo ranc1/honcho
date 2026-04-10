@@ -8,7 +8,7 @@
 
 ---
 
-Fork of [Honcho](https://github.com/plastic-labs/honcho) (v3.0.5) that adds an ACP (Agent Client Protocol) provider. Instead of calling LLM APIs directly, Honcho routes all LLM calls through an external ACP-compatible gateway via HTTP. All existing reasoning modules (deriver, dreamer, dialectic, summarizer) work without modification.
+Fork of [Honcho](https://github.com/plastic-labs/honcho) (v3.0.6) that adds an ACP (Agent Client Protocol) provider. Instead of calling LLM APIs directly, Honcho routes all LLM calls through an external ACP-compatible gateway via HTTP. All existing reasoning modules (deriver, dreamer, dialectic, summarizer) work without modification.
 
 This fork also fixes upstream bugs in the Conclusion API (`level` and `source_ids` fields) and configures embeddings for a local open-source model (`qwen3-embedding:0.6b` via Ollama, 1024 dimensions).
 
@@ -101,8 +101,8 @@ Server.
 
 Honcho is developed using [python](https://www.python.org/) and [uv](https://docs.astral.sh/uv/).
 
-The minimum python version is `3.9`
-The minimum uv version is `0.4.9`
+The minimum python version is `3.10`
+The minimum uv version is `0.5.0`
 
 ### Setup
 

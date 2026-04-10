@@ -155,7 +155,7 @@ app = FastAPI(
     title="Honcho API",
     summary="The Identity Layer for the Agentic World",
     description="""Honcho is a platform for giving agents user-centric memory and social cognition.""",
-    version="3.0.5",
+    version="3.0.6",
     contact={
         "name": "Plastic Labs",
         "url": "https://honcho.dev",
@@ -196,6 +196,12 @@ app.include_router(mcp_router)
 
 # Prometheus metrics endpoint
 app.add_route("/metrics", metrics_endpoint, methods=["GET"])
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring and container orchestration."""
+    return {"status": "ok"}
 
 
 # Global exception handlers
