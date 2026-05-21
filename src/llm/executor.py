@@ -19,7 +19,7 @@ from typing import Any, Literal, TypeVar, overload
 
 from pydantic import BaseModel
 
-from src.config import ModelConfig, ModelTransport
+from src.config import ModelConfig, ModelTransport, settings
 
 from .backend import CompletionResult as BackendCompletionResult
 from .backend import StreamChunk as BackendStreamChunk
@@ -210,6 +210,7 @@ async def honcho_llm_call_inner(
     selected_config: ModelConfig | None = None,
     plan: AttemptPlan | None = None,
     telemetry: LLMTelemetryContext | None = None,
+    tool_executor: Any | None = None,
 ) -> HonchoLLMCallResponse[M]: ...
 
 
@@ -234,6 +235,7 @@ async def honcho_llm_call_inner(
     selected_config: ModelConfig | None = None,
     plan: AttemptPlan | None = None,
     telemetry: LLMTelemetryContext | None = None,
+    tool_executor: Any | None = None,
 ) -> HonchoLLMCallResponse[str]: ...
 
 
@@ -258,6 +260,7 @@ async def honcho_llm_call_inner(
     selected_config: ModelConfig | None = None,
     plan: AttemptPlan | None = None,
     telemetry: LLMTelemetryContext | None = None,
+    tool_executor: Any | None = None,
 ) -> AsyncIterator[HonchoLLMCallStreamChunk]: ...
 
 
@@ -281,6 +284,7 @@ async def honcho_llm_call_inner(
     selected_config: ModelConfig | None = None,
     plan: AttemptPlan | None = None,
     telemetry: LLMTelemetryContext | None = None,
+    tool_executor: Any | None = None,
 ) -> HonchoLLMCallResponse[Any] | AsyncIterator[HonchoLLMCallStreamChunk]:
     """One backend call. No retry, no fallback, no tool loop.
 
@@ -303,19 +307,14 @@ async def honcho_llm_call_inner(
     if messages is None:
         messages = [{"role": "user", "content": prompt}]
 
-    # ACP provider — route through the external gateway HTTP bridge instead
-    # of an SDK backend. The "client" for "acp" is just the gateway URL
-    # registered in CLIENTS; there is no SDK object and no streaming
-    # backend, so the streaming path collapses to a single is_done chunk.
     if provider == "acp":
-        if not isinstance(client, str):
-            raise ValueError(
-                f"ACP provider expected gateway URL string, got {type(client).__name__}"
-            )
-        from src.config import settings
+        # Lazy import: avoids loading httpx/the ACP HTTP client at module
+        # import time when the gateway isn't configured.
         from src.utils.acp_provider import honcho_llm_call_inner_acp
 
+        assert isinstance(client, str)
         acp_start = time.perf_counter()
+        acp_error: BaseException | None = None
         try:
             acp_result = await honcho_llm_call_inner_acp(
                 gateway_url=client,
@@ -327,8 +326,12 @@ async def honcho_llm_call_inner(
                 tools=tools,
                 stream=False,
                 timeout_ms=settings.LLM.ACP_TIMEOUT_MS,
+                tool_executor=tool_executor,
             )
         except BaseException as exc:
+            acp_error = exc
+            raise
+        finally:
             _emit_llm_call_completed(
                 plan=plan,
                 telemetry=telemetry,
@@ -338,27 +341,13 @@ async def honcho_llm_call_inner(
                 duration_ms=(time.perf_counter() - acp_start) * 1000,
                 has_tools=bool(tools),
                 was_stream=stream,
-                outcome=_outcome_from_error(exc),
+                outcome=_outcome_from_error(acp_error),
                 result=None,
-                error=exc,
+                error=acp_error,
             )
-            raise
-
-        _emit_llm_call_completed(
-            plan=plan,
-            telemetry=telemetry,
-            provider=provider,
-            model=model,
-            max_tokens=max_tokens,
-            duration_ms=(time.perf_counter() - acp_start) * 1000,
-            has_tools=bool(tools),
-            was_stream=stream,
-            outcome="success",
-            result=None,
-            error=None,
-        )
 
         if stream:
+            # ACP has no native streaming — collapse to one is_done chunk.
             text = (
                 acp_result.content
                 if isinstance(acp_result.content, str)

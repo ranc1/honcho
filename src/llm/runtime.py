@@ -23,6 +23,7 @@ from src.config import (
     resolve_model_config,
     settings,
 )
+from src.exceptions import ValidationException
 
 from .registry import backend_for_provider, client_for_model_config
 from .types import ProviderClient, ReasoningEffortType
@@ -71,8 +72,7 @@ class AttemptPlan:
 
     provider: ModelTransport
     model: str
-    # `str` covers the "acp" transport — the value is the gateway URL,
-    # not an SDK client. The executor short-circuits ACP before backend dispatch.
+    # `str` covers the "acp" transport — value is the gateway URL.
     client: ProviderClient | str
     thinking_budget_tokens: int | None
     reasoning_effort: ReasoningEffortType
@@ -227,13 +227,9 @@ def effective_temperature(temperature: float | None) -> float | None:
 
 
 def resolve_backend_for_plan(plan: AttemptPlan) -> Any:
-    """Convenience helper: plan → ready-to-call ProviderBackend.
-
-    Not valid for the "acp" transport — the executor short-circuits ACP
-    before backend dispatch.
-    """
+    """Convenience helper: plan → ready-to-call ProviderBackend."""
     if isinstance(plan.client, str):
-        raise ValueError(
+        raise ValidationException(
             f"resolve_backend_for_plan does not support transport={plan.provider!r}; "
             "ACP requests dispatch via the HTTP bridge in the executor"
         )

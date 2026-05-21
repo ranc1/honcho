@@ -93,8 +93,8 @@ def get_gemini_override_client(
 
 # Module-level default-client registry, populated at import time. Tests patch
 # this dict via `patch.dict(CLIENTS, {...})` to inject mock provider clients.
-# `str` is allowed for the "acp" transport — the value is the gateway base URL,
-# not an SDK client. The executor short-circuits before backend dispatch.
+# `str` covers the "acp" transport: the value is the gateway URL, and the
+# executor short-circuits to the HTTP bridge before backend dispatch.
 CLIENTS: dict[ModelTransport, ProviderClient | str] = {}
 
 if settings.LLM.ANTHROPIC_API_KEY:
@@ -133,11 +133,8 @@ def client_for_model_config(
 
     Fast path: no overrides → reuse the module-level default client from
     CLIENTS (the test-mockable seam). Otherwise route through the cached
-    override factories.
-
-    For provider="acp" the returned value is a gateway URL string, not an
-    SDK client — the executor short-circuits to the ACP HTTP bridge before
-    backend dispatch.
+    override factories. For "acp" the returned value is a gateway URL
+    string rather than an SDK client.
     """
     if model_config.api_key is None and model_config.base_url is None:
         existing_client = CLIENTS.get(provider)
@@ -145,8 +142,8 @@ def client_for_model_config(
             return existing_client
 
     if provider == "acp":
-        # ACP doesn't use api_key/base_url overrides — the gateway URL
-        # comes from settings.LLM.ACP_GATEWAY_URL via the CLIENTS dict.
+        # Reached when ACP_GATEWAY_URL is unset OR when caller supplies
+        # api_key/base_url overrides — neither has meaning for ACP.
         raise ValidationException(
             "ACP provider requires LLM_ACP_GATEWAY_URL to be set"
         )
@@ -169,11 +166,7 @@ def backend_for_provider(
     provider: ModelTransport,
     client: ProviderClient,
 ) -> ProviderBackend:
-    """Wrap a raw provider SDK client in the matching ProviderBackend adapter.
-
-    Not called for provider="acp" — the executor dispatches ACP via the HTTP
-    bridge before reaching backend selection.
-    """
+    """Wrap a raw provider SDK client in the matching ProviderBackend adapter."""
     if provider == "anthropic":
         return AnthropicBackend(client)
     if provider == "openai":
@@ -181,9 +174,9 @@ def backend_for_provider(
     if provider == "gemini":
         return GeminiBackend(client)
     if provider == "acp":
-        raise ValueError(
-            "backend_for_provider does not support 'acp'; "
-            "ACP requests dispatch via the HTTP bridge in the executor"
+        raise ValidationException(
+            "ACP transport has no SDK backend; the executor short-circuits "
+            "to the HTTP bridge before reaching backend_for_provider"
         )
     assert_never(provider)
 
@@ -208,8 +201,7 @@ def get_backend(config: ModelConfig) -> ProviderBackend:
     """
     client = client_for_model_config(config.transport, config)
     if isinstance(client, str):
-        # ACP transport — has no SDK backend; live-test path doesn't support it.
-        raise ValueError(
+        raise ValidationException(
             f"get_backend does not support transport={config.transport!r}; "
             "ACP requests dispatch via the HTTP bridge in the executor"
         )

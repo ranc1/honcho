@@ -243,6 +243,7 @@ async def honcho_llm_call(
                 selected_config=plan.selected_config,
                 plan=plan,
                 telemetry=telemetry,
+                tool_executor=tool_executor,
             )
         return await honcho_llm_call_inner(
             plan.provider,
@@ -263,6 +264,7 @@ async def honcho_llm_call(
             selected_config=plan.selected_config,
             plan=plan,
             telemetry=telemetry,
+            tool_executor=tool_executor,
         )
 
     decorated = _call_with_provider_selection
@@ -313,8 +315,16 @@ async def honcho_llm_call(
             stop_seqs if stop_seqs is not None else runtime_model_config.stop_sequences
         )
 
+    # ACP-agentic path: when the resolved transport is "acp", the gateway
+    # engine drives the tool loop on its side via MCP. Honcho's local
+    # tool loop is bypassed (spec R2.9); we still need the tool_executor
+    # so the ACP provider can register MCP context for the gateway's
+    # tool calls. Route through the tool-less branch with the executor
+    # threaded through.
+    runtime_is_acp = runtime_model_config.transport == "acp"
+
     # Tool-less path: call once and return.
-    if not tools or not tool_executor:
+    if not tools or not tool_executor or runtime_is_acp:
         # enforce `max_input_tokens` for tool-less calls too. Before
         # this change, only `execute_tool_loop` consumed the kwarg — the
         # deriver passed it but it was silently dropped, so the cap-hit
@@ -373,6 +383,7 @@ async def honcho_llm_call(
                         plan=plan,
                         telemetry=telemetry,
                         messages=captured_messages,
+                        tool_executor=tool_executor,
                     )
                 return await honcho_llm_call_inner(
                     plan.provider,
@@ -394,6 +405,7 @@ async def honcho_llm_call(
                     plan=plan,
                     telemetry=telemetry,
                     messages=captured_messages,
+                    tool_executor=tool_executor,
                 )
 
             wrapped = _toolless_call
