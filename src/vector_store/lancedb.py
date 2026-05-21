@@ -17,7 +17,7 @@ from lancedb import AsyncConnection, AsyncTable
 from src.config import settings
 from src.exceptions import VectorStoreError
 
-from . import VectorQueryResult, VectorRecord, VectorStore, VectorUpsertResult
+from . import VectorQueryResult, VectorRecord, VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _VALID_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Schema for LanceDB tables
-# id: string, vector: fixed_size_list of float32 (1536 dimensions for OpenAI embeddings)
+# id: string, vector: fixed_size_list of float32 (dimension from embedding settings)
 # Additional metadata columns are added dynamically
 
 # pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownParameterType=false
@@ -93,13 +93,13 @@ class LanceDBVectorStore(VectorStore):
         fields: list[pa.Field] = [
             pa.field("id", pa.string()),
             pa.field(
-                "vector", pa.list_(pa.float32(), settings.VECTOR_STORE.DIMENSIONS)
+                "vector", pa.list_(pa.float32(), settings.EMBEDDING.VECTOR_DIMENSIONS)
             ),
         ]
         fields.extend(self._metadata_fields_for_namespace(namespace))
         schema = pa.schema(fields)
         try:
-            table = await db.create_table(namespace, schema=schema)  # pyright: ignore[reportUnknownArgumentType]
+            table = await db.create_table(namespace, schema=schema)
             return table
         except Exception:
             # Table may have been created by another worker, try to open it
@@ -156,7 +156,7 @@ class LanceDBVectorStore(VectorStore):
         self,
         namespace: str,
         vectors: list[VectorRecord],
-    ) -> VectorUpsertResult:
+    ) -> None:
         """
         Upsert multiple vectors into LanceDB.
 
@@ -165,7 +165,7 @@ class LanceDBVectorStore(VectorStore):
             vectors: List of VectorRecord objects to upsert
         """
         if not vectors:
-            return VectorUpsertResult(ok=True)
+            return
 
         try:
             rows = [self._row_to_dict(v) for v in vectors]
@@ -180,7 +180,7 @@ class LanceDBVectorStore(VectorStore):
             )
 
             logger.debug(f"Upserted {len(vectors)} vectors to namespace {namespace}")
-            return VectorUpsertResult(ok=True)
+            return
         except Exception as e:
             logger.exception(
                 f"Failed to upsert {len(vectors)} vectors to namespace {namespace}"
@@ -197,6 +197,7 @@ class LanceDBVectorStore(VectorStore):
         top_k: int = 10,
         filters: dict[str, Any] | None = None,
         max_distance: float | None = None,
+        include_attributes: bool | list[str] = True,
     ) -> list[VectorQueryResult]:
         """
         Query for similar vectors in LanceDB.
@@ -207,6 +208,8 @@ class LanceDBVectorStore(VectorStore):
             top_k: Maximum number of results to return
             filters: Optional metadata filters
             max_distance: Optional maximum distance threshold (cosine distance)
+            include_attributes: Attributes to return with each result. False returns
+                no metadata; a list returns only those metadata fields.
 
         Returns:
             List of VectorQueryResult objects, ordered by similarity (most similar first)
@@ -217,8 +220,14 @@ class LanceDBVectorStore(VectorStore):
             return []
 
         try:
-            # Build query
             query = table.vector_search(embedding).distance_type("cosine").limit(top_k)
+
+            if include_attributes is False:
+                # Caller only needs id/score. Don't fetch any metadata or the vector.
+                query = query.select(["id"])
+            elif isinstance(include_attributes, list):
+                projection = ["id", *(c for c in include_attributes if c != "id")]
+                query = query.select(projection)
 
             # Apply filters if provided
             if filters:
@@ -369,3 +378,28 @@ class LanceDBVectorStore(VectorStore):
             self._db.close()
             self._db = None
             logger.debug("LanceDB connection closed")
+
+    async def probe_namespace_dim(self, namespace: str) -> int | None:
+        """Inspect a LanceDB table's vector column to recover its declared dim.
+
+        Returns ``None`` only when the table does not exist (lazy-create
+        model, expected case). When the table exists but its schema does
+        not include a ``vector`` field with a fixed ``list_size``, raises
+        ``VectorStoreError`` — that is a malformed table, not a missing one,
+        and silently bucketing it as "missing" would let real corruption
+        through the startup validator.
+        """
+        db = await self._get_db()
+        table_names = await db.table_names()
+        if namespace not in table_names:
+            return None
+        table = await db.open_table(namespace)
+        schema = await table.schema()
+        for field in schema:
+            if field.name == "vector" and hasattr(field.type, "list_size"):
+                return int(field.type.list_size)
+        raise VectorStoreError(
+            f"LanceDB table {namespace!r} exists but has no 'vector' field"
+            + " with a fixed dimension; cannot probe dim. Schema may be"
+            + " corrupted — inspect with `lancedb` CLI before retrying."
+        )

@@ -89,22 +89,243 @@ Serves external consumers (CLI engines, integrations). Reuses the upstream TypeS
 - **Tools (30)**: All upstream tools including `query_conclusions`, `create_conclusions`, `chat`, `get_peer_card`, `get_session_messages`, `search`, etc.
 - **Config**: `MCP_WORKSPACE_ID`, `HONCHO_BASE_URL`, `HONCHO_API_KEY` env vars
 
-## Local Development
+Get an API key at [app.honcho.dev](https://app.honcho.dev) — when you sign up you'll be prompted to join an organization, which gets its own dedicated Honcho instance and $100 free credits. Or [self-host](#self-hosting) and run against `http://localhost:8000`.
 
-Below is a guide on setting up a local environment for running the Honcho
-Server.
+### Python
 
-> This guide was made using a M3 Macbook Pro. For any compatibility issues
-> on different platforms, please raise an Issue.
+```bash
+pip install honcho-ai
+# or: uv add honcho-ai
+# or: poetry add honcho-ai
+```
 
-### Prerequisites and Dependencies
+```python
+import os
+from honcho import Honcho
+
+# Managed service uses api.honcho.dev by default. For self-hosted, pass
+# base_url="http://localhost:8000" or set HONCHO_URL.
+honcho = Honcho(
+    workspace_id="my-app-testing",
+    api_key=os.environ["HONCHO_API_KEY"],
+)
+
+# 1. Store: peers and messages on a session
+alice = honcho.peer("alice")
+tutor = honcho.peer("tutor")
+session = honcho.session("session-1")
+session.add_messages([
+    alice.message("Hey there — can you help me with my math homework?"),
+    tutor.message("Absolutely. Send me your first problem!"),
+])
+
+# 2. Reason: happens asynchronously in the background.
+
+# 3. Query: ask Honcho what it knows, or pull prompt-ready context.
+answer = alice.chat("What learning styles does the user respond to best?")
+context = session.context(summary=True, tokens=10_000)
+
+# 4. Inject: hand the context to your model of choice.
+from openai import OpenAI
+client = OpenAI()
+completion = client.chat.completions.create(
+    model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+    messages=context.to_openai(assistant=tutor),
+)
+```
+
+### TypeScript
+
+```bash
+npm install @honcho-ai/sdk
+# or: bun add @honcho-ai/sdk
+```
+
+```typescript
+import { Honcho } from "@honcho-ai/sdk";
+import OpenAI from "openai";
+
+const honcho = new Honcho({
+  workspaceId: "my-app-testing",
+  apiKey: process.env.HONCHO_API_KEY,
+});
+
+const alice = await honcho.peer("alice");
+const tutor = await honcho.peer("tutor");
+const session = await honcho.session("session-1");
+await session.addMessages([
+  alice.message("Hey there — can you help me with my math homework?"),
+  tutor.message("Absolutely. Send me your first problem!"),
+]);
+
+const answer = await alice.chat(
+  "What learning styles does the user respond to best?",
+);
+const context = await session.context({ summary: true, tokens: 10_000 });
+
+const openai = new OpenAI();
+const completion = await openai.chat.completions.create({
+  model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+  messages: context.toOpenAI({ assistant: tutor }),
+});
+```
+
+> **Note:** background reasoning is asynchronous. Newly-added messages may take a moment to be reflected in chat/representation responses; for low-latency reads, use the [`representation`](https://honcho.dev/docs/v3/documentation/features/representation) endpoint.
+
+## What Honcho Gives You
+
+| Need                               | API                                                             |
+| ---------------------------------- | --------------------------------------------------------------- |
+| Save interaction history           | `session.add_messages(...)`                                     |
+| Ask what Honcho knows about a peer | `peer.chat(...)`                                                |
+| Get prompt-ready context           | `session.context(...).to_openai(...)` / `.to_anthropic(...)`    |
+| Hybrid search (BM25 + vector)      | `peer.search(...)`, `session.search(...)`, `honcho.search(...)` |
+| Low-latency static representations | `peer.representation(...)`, `session.representation(...)`       |
+| Import documents                   | `session.upload_file(...)`                                      |
+| Inspect background processing      | `honcho.queue_status(...)`                                      |
+
+See the full [SDK Reference](https://honcho.dev/docs/v3/documentation/reference/sdk) and [API Reference](https://honcho.dev/docs/v3/api-reference/introduction).
+
+## Integrations
+
+### Claude Code
+
+Two ways, depending on how deep you want to go:
+
+**Plugin (richer integration — recommended for Claude Code users):**
+
+```text
+/plugin marketplace add plastic-labs/claude-honcho
+/plugin install honcho@honcho
+```
+
+**Raw MCP (works in any MCP client — Cursor, Cline, Windsurf, etc.):**
+
+```bash
+claude mcp add honcho \
+  --transport http \
+  --url "https://mcp.honcho.dev" \
+  --header "Authorization: Bearer hch-your-key-here" \
+  --header "X-Honcho-User-Name: YourName"
+```
+
+Details: [Claude Code guide](https://honcho.dev/docs/v3/guides/integrations/claude-code) · [MCP guide](https://honcho.dev/docs/v3/guides/integrations/mcp).
+
+### OpenCode
+
+```bash
+opencode plugin "@honcho-ai/opencode-honcho" --global
+```
+
+Details: [OpenCode guide](https://honcho.dev/docs/v3/guides/integrations/opencode).
+
+### OpenClaw
+
+```bash
+openclaw plugins install @honcho-ai/openclaw-honcho
+openclaw honcho setup
+openclaw gateway --force
+```
+
+`openclaw honcho setup` prompts for your API key, writes the config, and optionally migrates legacy `MEMORY.md` / `USER.md` / `IDENTITY.md` files into Honcho (non-destructive — originals are never deleted). Details: [OpenClaw guide](https://honcho.dev/docs/v3/guides/integrations/openclaw).
+
+### Hermes
+
+```bash
+hermes memory setup   # select "honcho", point at api.honcho.dev or your local server
+```
+
+Details: [Hermes guide](https://honcho.dev/docs/v3/guides/integrations/hermes).
+
+### Add Honcho to your own codebase (agent skill)
+
+For wiring the Honcho SDK into an existing application, install the integration skill — it explores your codebase, asks about integration preferences, generates the SDK setup, and verifies it works:
+
+```bash
+npx skills add plastic-labs/honcho
+```
+
+Then invoke `/honcho-integration` in Claude Code (or `/honcho-dev:integrate` via the plugin marketplace). Details: [agentic development guide](https://honcho.dev/docs/v3/documentation/introduction/vibecoding).
+
+### Other MCP clients
+
+The same `claude mcp add` form (or its client-specific equivalent) works in any MCP-compatible client. See [MCP guide](https://honcho.dev/docs/v3/guides/integrations/mcp).
+
+## Core Concepts
+
+Honcho organises everything around **peers** — humans and AI agents alike are first-class entities. The peer model enables:
+
+- Multi-participant sessions with mixed human and AI agents
+- Configurable observation settings (which peers observe which others)
+- Flexible identity management for all participants
+- Support for complex multi-agent interactions
+
+Peers exchange messages within sessions; Honcho reasons over those messages to build a representation of each peer that you can query.
+
+- **Workspace** (formerly App): top-level container; isolates data between use cases.
+- **Peer** (formerly User): any participant — human user or AI agent.
+- **Session**: a conversation context; many-to-many with peers.
+- **Message**: an atomic data unit (peer-to-peer communication or ingested document chunk).
+
+What you query out of Honcho:
+
+- **Conclusions** — what Honcho has extracted about a peer (deductive and inductive). Exposed via the [conclusions API](https://honcho.dev/docs/v3/api-reference/introduction).
+- **Representations** — static, low-latency snapshots of what Honcho knows about a peer (optionally session-scoped).
+- **Peer Cards** — compact identity summaries.
+- **Session context / summaries** — prompt-ready bundles for long-running conversations.
+
+<!-- markdownlint-disable MD033 -->
+<details>
+<summary>Internal storage (Collections &amp; Documents)</summary>
+
+Internally, Honcho stores peer-related observations in **collections** of vector-embedded **documents**. Collections are keyed by `(observer, observed)` peer pairs — the same mechanism powers self-representation (`observer == observed`) and cross-peer modelling (peer X's understanding of peer Y). These primitives are not exposed directly; the Conclusions API is the public surface.
+
+</details>
+<!-- markdownlint-enable MD033 -->
+
+<!-- TODO(vineeth/marketing): write the "Honcho vs RAG / vector DB / memory-only" comparison.
+     Audit recommendation referenced; copy intentionally deferred to avoid inventing
+     positioning claims unsupported by primary sources. -->
+
+## Benchmarks &amp; Evals
+
+Honcho's evals span LongMemEval, LoCoMo, and other long-conversation benchmarks. See the [evals page](https://honcho.dev/evals/), the [research blog post](https://blog.plasticlabs.ai/research/Benchmarking-Honcho), and the [Pareto-frontier announcement video](https://x.com/honchodotdev/status/2002090546521911703?s=20) for methodology and reproducible results.
+
+## Self-hosting
+
+Honcho is open source under AGPL-3.0. You can run the full server locally with Docker, then point the SDKs at `http://localhost:8000`.
+
+### Quick start (Docker)
+
+```bash
+git clone https://github.com/plastic-labs/honcho.git
+cd honcho
+cp docker-compose.yml.example docker-compose.yml
+cp .env.template .env       # fill in LLM_GEMINI_API_KEY / LLM_ANTHROPIC_API_KEY / LLM_OPENAI_API_KEY
+docker compose up
+```
+
+Then point the SDKs at it:
+
+```python
+honcho = Honcho(workspace_id="my-app-testing", base_url="http://localhost:8000")
+# or: export HONCHO_URL=http://localhost:8000
+```
+
+<!-- markdownlint-disable MD033 -->
+<details>
+<summary>Local development without Docker</summary>
+
+Below is a guide on setting up a local environment for running the Honcho Server without Docker.
+
+#### Prerequisites and Dependencies
 
 Honcho is developed using [python](https://www.python.org/) and [uv](https://docs.astral.sh/uv/).
 
 The minimum python version is `3.10`
 The minimum uv version is `0.5.0`
 
-### Setup
+#### Setup
 
 1. **Clone the repository**
 
@@ -165,7 +386,8 @@ uv run python -m src.deriver
 
 The deriver generates representations, summaries, peer cards, and manages dreaming tasks.
 
-### Pre-commit Hooks
+</details>
+<!-- markdownlint-enable MD033 -->
 
 Honcho uses pre-commit hooks to ensure code quality and consistency.
 
@@ -214,7 +436,7 @@ The TOML file is organized into sections:
 - `[llm]` - LLM provider API keys and general settings
 - `[deriver]` - Background worker settings and representation configuration
 - `[peer_card]` - Peer card generation settings
-- `[dialectic]` - Dialectic API configuration with per-level reasoning settings
+- `[dialectic]` - Chat Endpoint configuration with per-level reasoning settings
 - `[summary]` - Session summarization settings
 - `[dream]` - Dream processing configuration
 - `[webhook]` - Webhook configuration
@@ -227,7 +449,8 @@ The TOML file is organized into sections:
 
 All configuration values can be overridden using environment variables:
 
-- `{SECTION}_{KEY}` for nested settings
+- `{SECTION}_{KEY}` for top-level section settings
+- Use `__` inside `{KEY}` for nested settings
 - Just `{KEY}` for app-level settings
 
 Examples:
@@ -250,9 +473,12 @@ Examples:
 The functionality of Honcho can be split into two different services: Storage
 and Reasoning.
 
-### Peer Paradigm
+**Key features:**
 
-Honcho uses an entity-centric model where both users and agents are represented as "[peers](https://blog.plasticlabs.ai/blog/Beyond-the-User-Assistant-Paradigm;-Introducing-Peers)". This unified approach enables:
+- **Rich Reasoning System** — multiple implementation methods that extract conclusions from interactions and build comprehensive representations of peers
+- **Chat Endpoint** — reasoning-informed responses that integrate conclusions with current context
+- **Background Processing** — asynchronous processing pipeline for expensive operations like representation updates and session summarization
+- **Multi-Provider Support** — configurable LLM providers for different use cases
 
 - Multi-participant sessions with mixed human and AI agents
 - Configurable observation settings (which peers observe which others)
@@ -267,8 +493,7 @@ Honcho contains several primitives for storing application and peer data:
 Workspaces
 ├── Peers ←──────────────────┐
 │   ├── Sessions             │
-│   └── Collections          │
-│       └── Documents        │
+│   └── (internal collections, keyed by observer/observed peer pair)
 │                            │
 └── Sessions ←───────────────┤ (many-to-many)
     ├── Peers ───────────────┘

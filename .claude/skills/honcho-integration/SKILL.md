@@ -91,6 +91,8 @@ Based on interview responses, implement the integration:
 
 ### Phase 4: Verification
 
+- If the Honcho CLI is available, run `honcho doctor` to confirm connectivity before testing the integration code
+- Use `honcho peer list` and `honcho peer chat` to verify peers exist and the dialectic endpoint works independently of the integration
 - Ensure all message exchanges are stored to Honcho
 - Verify AI peers have `observe_me=False` (unless user specifically wants AI observation)
 - Check that the workspace ID is consistent across the codebase
@@ -100,11 +102,21 @@ Based on interview responses, implement the integration:
 
 ## Before You Start
 
-1. **Check the latest SDK versions** at <https://docs.honcho.dev/changelog/introduction>
+1. **Check the latest SDK versions** at <https://honcho.dev/docs/changelog/introduction>
    - Python SDK: `honcho-ai`
    - TypeScript SDK: `@honcho-ai/sdk`
 
 2. **Get an API key** ask the user to get a Honcho API key from <https://app.honcho.dev> and add it to the environment.
+
+3. **Verify with the CLI** (optional but recommended). If the user has the Honcho CLI installed (`pip install honcho-cli`), they can validate their setup before writing any integration code:
+
+   ```bash
+   honcho init          # persist API key + URL to ~/.honcho/config.json
+   honcho doctor        # verify connectivity, config, workspace health
+   honcho peer chat     # test the dialectic endpoint interactively
+   ```
+
+   This is the fastest way to confirm the API key and URL are correct before debugging SDK code.
 
 ## Installation
 
@@ -524,6 +536,8 @@ When integrating Honcho into an existing codebase:
   - [ ] Pre-fetch pattern for simpler integrations
   - [ ] context() for conversation history
 - [ ] Store messages after each exchange to build user models
+- [ ] (Optional) Run `honcho doctor` to verify connectivity before testing integration code
+- [ ] (Optional) Use `honcho peer chat` to test dialectic queries independently
 
 ## Common Mistakes to Avoid
 
@@ -535,6 +549,6 @@ When integrating Honcho into an existing codebase:
 
 ## Resources
 
-- Documentation: <https://docs.honcho.dev>
-- Latest SDK versions: <https://docs.honcho.dev/changelog/introduction>
-- API Reference: <https://docs.honcho.dev/v3/api-reference/introduction>
+- Documentation: <https://honcho.dev/docs>
+- Latest SDK versions: <https://honcho.dev/docs/changelog/introduction>
+- API Reference: <https://honcho.dev/docs/v3/api-reference/introduction>

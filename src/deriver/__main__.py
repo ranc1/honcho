@@ -6,6 +6,8 @@ import uvloop
 from prometheus_client import start_http_server
 
 from src.config import settings
+from src.db import engine
+from src.startup import validate_embedding_schema
 from src.telemetry import initialize_telemetry_async, shutdown_telemetry
 
 from .queue_manager import main
@@ -50,14 +52,18 @@ def setup_logging():
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("openai._base_client").setLevel(logging.WARNING)
-    logging.getLogger("groq._base_client").setLevel(logging.WARNING)
 
 
 async def run_deriver():
     """Run the deriver with proper telemetry lifecycle management."""
     # Initialize async telemetry (CloudEvents emitter)
     await initialize_telemetry_async()
+
     try:
+        # Fail fast if the embedding schema does not match settings — same
+        # gate the API runs in its lifespan. Inside the try block so the
+        # telemetry buffer is still flushed if validation raises.
+        await validate_embedding_schema(engine)
         await main()
     finally:
         # Shutdown telemetry (flush CloudEvents buffer)

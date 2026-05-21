@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from nanoid import generate as generate_nanoid
@@ -13,7 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src import crud, models, schemas
 from src.config import settings
 from src.utils.agent_tools import (
+    MAX_PEER_CARD_ENTRY_LENGTH,
     MAX_PEER_CARD_FACTS,
+    PEER_CARD_ALLOWED_PREFIXES,
     ObservationsCreatedResult,
     ToolContext,
     _handle_create_observations,  # pyright: ignore[reportPrivateUsage]
@@ -31,6 +34,7 @@ from src.utils.agent_tools import (
     _handle_search_messages,  # pyright: ignore[reportPrivateUsage]
     _handle_search_messages_temporal,  # pyright: ignore[reportPrivateUsage]
     _handle_update_peer_card,  # pyright: ignore[reportPrivateUsage]
+    _validate_peer_card_entry,  # pyright: ignore[reportPrivateUsage]
     create_observations,
     create_tool_executor,
     extract_preferences,
@@ -140,6 +144,9 @@ def make_tool_context(tool_test_data: Any) -> Callable[..., ToolContext]:
         include_observation_ids: bool = False,
         history_token_limit: int = 8192,
         session_name: str | None = None,
+        run_id: str | None = None,
+        agent_type: str | None = None,
+        parent_category: str | None = None,
     ) -> ToolContext:
         return ToolContext(
             workspace_name=workspace.name,
@@ -150,6 +157,9 @@ def make_tool_context(tool_test_data: Any) -> Callable[..., ToolContext]:
             include_observation_ids=include_observation_ids,
             history_token_limit=history_token_limit,
             db_lock=shared_lock,
+            run_id=run_id,
+            agent_type=agent_type,
+            parent_category=parent_category,
         )
 
     return _make_context
@@ -246,7 +256,8 @@ class TestCreateObservations:
         result = await _handle_create_observations(ctx, {"observations": []})
 
         assert "ERROR" in result
-        assert "empty" in result.lower()
+        # Handlers may return ToolResult (); str() returns .content.
+        assert "empty" in str(result).lower()
 
     async def test_batch_embedding_failure_falls_back_to_individual_embeds(
         self,
@@ -371,6 +382,98 @@ class TestCreateObservations:
         assert len(created_documents) == 1
         assert created_documents[0].content == "Embeds fine"
 
+    async def test_create_observations_filters_blank_content_before_embedding(
+        self,
+        tool_test_data: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Blank or whitespace-only observations are dropped before embedding/persistence."""
+        workspace, peer1, peer2, session, _, _ = tool_test_data
+        created_documents: list[Any] = []
+
+        async def fake_batch_embed(texts: list[str]) -> list[list[float]]:
+            assert texts == ["trimmed observation"]
+            return [[0.4, 0.5, 0.6]]
+
+        async def fake_create_documents(
+            _db: AsyncSession,
+            documents: list[Any],
+            workspace_name: str,
+            *,
+            observer: str,
+            observed: str,
+            deduplicate: bool = False,
+        ) -> list[Any]:
+            _ = (workspace_name, observer, observed, deduplicate)
+            created_documents.extend(documents)
+            return documents
+
+        monkeypatch.setattr(
+            "src.utils.agent_tools.embedding_client.simple_batch_embed",
+            fake_batch_embed,
+        )
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.create_documents", fake_create_documents
+        )
+
+        result = await create_observations(
+            observations=[
+                schemas.ObservationInput(content="   ", level="explicit"),
+                schemas.ObservationInput(
+                    content=" trimmed observation ", level="explicit"
+                ),
+            ],
+            observer=peer1.name,
+            observed=peer2.name,
+            session_name=session.name,
+            workspace_name=workspace.name,
+            message_ids=[],
+            message_created_at=str(datetime.now(timezone.utc)),
+        )
+
+        assert isinstance(result, ObservationsCreatedResult)
+        assert result.created_count == 1
+        assert len(result.failed) == 0
+        assert len(created_documents) == 1
+        assert created_documents[0].content == "trimmed observation"
+
+    async def test_create_observations_skips_all_blank_content(
+        self,
+        tool_test_data: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """All-blank observations short-circuit without embedding or persistence."""
+        workspace, peer1, peer2, session, _, _ = tool_test_data
+        batch_embed = AsyncMock()
+        create_documents = AsyncMock()
+
+        monkeypatch.setattr(
+            "src.utils.agent_tools.embedding_client.simple_batch_embed",
+            batch_embed,
+        )
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.create_documents", create_documents
+        )
+
+        result = await create_observations(
+            observations=[
+                schemas.ObservationInput(content=" ", level="explicit"),
+                schemas.ObservationInput(content="\n\t", level="explicit"),
+            ],
+            observer=peer1.name,
+            observed=peer2.name,
+            session_name=session.name,
+            workspace_name=workspace.name,
+            message_ids=[],
+            message_created_at=str(datetime.now(timezone.utc)),
+        )
+
+        assert isinstance(result, ObservationsCreatedResult)
+        assert result.created_count == 0
+        assert len(result.failed) == 0
+        batch_embed.assert_not_awaited()
+        create_documents.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 class TestDeleteObservations:
@@ -411,6 +514,82 @@ class TestDeleteObservations:
 
         # Should report 0 deleted (graceful handling)
         assert "Deleted 0 observations" in result
+
+    async def test_delete_batch_emits_levels_for_successful_only(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Batch delete with mixed levels emits levels only for rows actually deleted."""
+        workspace, peer1, peer2, session, _messages, documents = tool_test_data
+
+        # Add two extra documents with non-explicit levels so the batch spans levels.
+        deductive_doc = models.Document(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            content="Works in tech",
+            embedding=[0.42] * 1536,
+            session_name=session.name,
+            level="deductive",
+            metadata={},
+        )
+        inductive_doc = models.Document(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            content="Tends to be an early riser",
+            embedding=[0.43] * 1536,
+            session_name=session.name,
+            level="inductive",
+            metadata={},
+        )
+        db_session.add_all([deductive_doc, inductive_doc])
+        await db_session.flush()
+        await db_session.refresh(deductive_doc)
+        await db_session.refresh(inductive_doc)
+        await db_session.commit()
+
+        # Capture emitted telemetry events.
+        from src.telemetry.events import AgentToolConclusionsDeletedEvent
+        from src.telemetry.events.base import BaseEvent
+        from src.utils import agent_tools as agent_tools_module
+
+        captured: list[BaseEvent] = []
+
+        def _capture(event: BaseEvent) -> None:
+            captured.append(event)
+
+        monkeypatch.setattr(agent_tools_module, "emit", _capture)
+
+        ctx = make_tool_context(
+            include_observation_ids=True,
+            run_id="test_run",
+            agent_type="deduction",
+            parent_category="dream",
+        )
+
+        explicit_doc_id = documents[0].id
+        ids_to_delete = [
+            explicit_doc_id,
+            deductive_doc.id,
+            inductive_doc.id,
+            "nonexistent_id_12345",
+        ]
+
+        result = await _handle_delete_observations(
+            ctx, {"observation_ids": ids_to_delete}
+        )
+
+        assert "Deleted 3 observations" in result
+        assert len(captured) == 1
+        event = captured[0]
+        assert isinstance(event, AgentToolConclusionsDeletedEvent)
+        assert event.conclusion_count == 3
+        # RETURNING order is not guaranteed; compare as multiset.
+        assert sorted(event.levels) == sorted(["explicit", "deductive", "inductive"])
 
 
 @pytest.mark.asyncio
@@ -580,8 +759,12 @@ class TestSearchMessages:
 
         result = await _handle_search_messages(ctx, {"query": "test message"})
 
-        # Should return some result (may be empty if semantic search doesn't match)
-        assert isinstance(result, str)
+        # handler may return ToolResult (with search metadata) or
+        # a plain str. Both carry the result text; just check it's
+        # introspectable as string content.
+        from src.utils.types import ToolResult
+
+        assert isinstance(result, str | ToolResult)
 
 
 @pytest.mark.asyncio
@@ -722,7 +905,7 @@ class TestGetRecentHistory:
         result = await _handle_get_recent_history(ctx, {})
 
         assert "Conversation history" in result
-        assert "messages" in result.lower()
+        assert "messages" in str(result).lower()
 
     async def test_without_session_uses_observed(
         self,
@@ -843,7 +1026,14 @@ class TestUpdatePeerCard:
         ctx = make_tool_context()
 
         result = await _handle_update_peer_card(
-            ctx, {"content": ["Name: John", "Location: NYC", "Occupation: Engineer"]}
+            ctx,
+            {
+                "content": [
+                    "IDENTITY: Name: John",
+                    "ATTRIBUTE: Location: NYC",
+                    "ATTRIBUTE: Occupation: Engineer",
+                ]
+            },
         )
 
         assert "Updated peer card" in result
@@ -858,7 +1048,7 @@ class TestUpdatePeerCard:
             observed=peer2.name,
         )
         assert peer_card is not None
-        assert "Name: John" in peer_card
+        assert "IDENTITY: Name: John" in peer_card
 
     async def test_deduplicates_and_caps_peer_card(
         self,
@@ -870,8 +1060,15 @@ class TestUpdatePeerCard:
         workspace, peer1, peer2, _, _, _ = tool_test_data
         ctx = make_tool_context()
 
-        oversized = ["Name: John", "  Name:  John  ", "", "   "]
-        oversized.extend([f"Fact {i}" for i in range(MAX_PEER_CARD_FACTS + 5)])
+        oversized = [
+            "IDENTITY: Name: John",
+            "  IDENTITY: Name: John  ",
+            "",
+            "   ",
+        ]
+        oversized.extend(
+            [f"IDENTITY: Aliases: alias-{i}" for i in range(MAX_PEER_CARD_FACTS + 5)]
+        )
 
         await _handle_update_peer_card(ctx, {"content": oversized})
 
@@ -886,7 +1083,7 @@ class TestUpdatePeerCard:
         assert peer_card is not None
         assert len(peer_card) == MAX_PEER_CARD_FACTS
         assert all(line.strip() for line in peer_card)
-        assert peer_card.count("Name: John") == 1
+        assert peer_card.count("IDENTITY: Name: John") == 1
 
     async def test_none_content_preserves_existing_card(
         self,
@@ -900,12 +1097,13 @@ class TestUpdatePeerCard:
 
         # First, create a valid peer card
         await _handle_update_peer_card(
-            ctx, {"content": ["Name: Alice", "Location: NYC"]}
+            ctx,
+            {"content": ["IDENTITY: Name: Alice", "ATTRIBUTE: Location: NYC"]},
         )
 
         # Now attempt to update with None — should be a no-op
         result = await _handle_update_peer_card(ctx, {"content": None})
-        assert "empty" in result.lower()
+        assert "empty" in str(result).lower()
 
         # Refresh the observer so the identity map picks up the committed update
         await db_session.refresh(peer1)
@@ -917,7 +1115,7 @@ class TestUpdatePeerCard:
             observed=peer2.name,
         )
         assert peer_card is not None
-        assert "Name: Alice" in peer_card
+        assert "IDENTITY: Name: Alice" in peer_card
 
     async def test_empty_list_preserves_existing_card(
         self,
@@ -930,11 +1128,14 @@ class TestUpdatePeerCard:
         ctx = make_tool_context()
 
         # First, create a valid peer card
-        await _handle_update_peer_card(ctx, {"content": ["Name: Bob", "Age: 30"]})
+        await _handle_update_peer_card(
+            ctx,
+            {"content": ["IDENTITY: Name: Bob", "ATTRIBUTE: Age: 30"]},
+        )
 
         # Now attempt to update with empty list — should be a no-op
         result = await _handle_update_peer_card(ctx, {"content": []})
-        assert "empty" in result.lower()
+        assert "empty" in str(result).lower()
 
         # Refresh the observer so the identity map picks up the committed update
         await db_session.refresh(peer1)
@@ -946,7 +1147,151 @@ class TestUpdatePeerCard:
             observed=peer2.name,
         )
         assert peer_card is not None
-        assert "Name: Bob" in peer_card
+        assert "IDENTITY: Name: Bob" in peer_card
+
+    async def test_rejects_entries_without_allowed_prefix(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """Entries without an allowed prefix are dropped; valid entries pass through."""
+        from src.utils.types import ToolResult
+
+        workspace, peer1, peer2, _, _, _ = tool_test_data
+        ctx = make_tool_context()
+
+        result = await _handle_update_peer_card(
+            ctx,
+            {
+                "content": [
+                    "IDENTITY: Name: Carol",
+                    "Age: 39+",  # rejected: no prefix
+                    "Daughter: Keyan",  # rejected: no prefix
+                    "TRAIT: Methodical",  # rejected: TRAIT not allowed
+                    "PREFERENCE: Tea",  # rejected: bare PREFERENCE not allowed
+                    "ATTRIBUTE: Location: Germantown, TN",
+                ]
+            },
+        )
+
+        # Partial-reject success path must surface the rejection in the tool
+        # response so the model can re-emit the dropped entries (with correct
+        # prefixes) on a retry instead of silently losing them.
+        assert isinstance(result, ToolResult)
+        content_lower = str(result).lower()
+        assert "updated peer card" in content_lower
+        assert "rejected 4 of 6" in content_lower
+        # At least one rejected sample should appear so the model knows what
+        # to fix.
+        assert "age: 39+" in content_lower or "trait: methodical" in content_lower
+        assert result.metadata is not None
+        assert result.metadata["peer_card_updated"] is True
+        assert result.metadata["facts_count"] == 2
+        assert result.metadata["rejected_count"] == 4
+
+        await db_session.refresh(peer1)
+        peer_card = await crud.get_peer_card(
+            db_session,
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+        )
+        assert peer_card is not None
+        assert peer_card == [
+            "IDENTITY: Name: Carol",
+            "ATTRIBUTE: Location: Germantown, TN",
+        ]
+
+    async def test_all_entries_rejected_preserves_existing_card(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """When every entry fails validation, the existing card is preserved."""
+        workspace, peer1, peer2, _, _, _ = tool_test_data
+        ctx = make_tool_context()
+
+        await _handle_update_peer_card(ctx, {"content": ["IDENTITY: Name: Dana"]})
+
+        result = await _handle_update_peer_card(
+            ctx,
+            {
+                "content": [
+                    "TRAIT: Detail-oriented",
+                    "PREFERENCE: Coffee",
+                    "Random unprefixed line",
+                ]
+            },
+        )
+        assert "rejected" in str(result).lower()
+
+        await db_session.refresh(peer1)
+        peer_card = await crud.get_peer_card(
+            db_session,
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+        )
+        assert peer_card == ["IDENTITY: Name: Dana"]
+
+
+class TestPeerCardEntryValidator:
+    """Unit tests for the pure structural validator."""
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "IDENTITY: Name: Alice",
+            "ATTRIBUTE: Location: NYC",
+            "ATTRIBUTE: Prefers tea",
+            "RELATIONSHIP: Spouse: Bob",
+            "RELATIONSHIP: Maintainer: vineeth",
+            "INSTRUCTION: Call me Vee",
+            "INSTRUCTION: Never push to main without review",
+        ],
+    )
+    def test_accepts_well_formed_entries(self, entry: str):
+        assert _validate_peer_card_entry(entry) is True
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "",
+            "   ",
+            "Name: Alice",  # missing prefix
+            "Age: 39+",  # missing prefix
+            "Daughter: Keyan",  # missing prefix
+            "TRAIT: Methodical",  # disallowed kind
+            "PREFERENCE: Tea",  # disallowed kind
+            "identity: name: alice",  # wrong case
+            "IDENTITY:Name: Alice",  # missing space after colon
+            "IDENTITY: ",  # empty body
+            "IDENTITY:    ",  # whitespace-only body
+        ],
+    )
+    def test_rejects_malformed_entries(self, entry: str):
+        assert _validate_peer_card_entry(entry) is False
+
+    def test_rejects_over_length_cap(self):
+        long_value = "x" * (MAX_PEER_CARD_ENTRY_LENGTH + 1)
+        assert _validate_peer_card_entry(f"IDENTITY: Name: {long_value}") is False
+
+    def test_accepts_at_length_cap(self):
+        # Build an entry exactly at the cap.
+        prefix = "IDENTITY: "
+        body = "x" * (MAX_PEER_CARD_ENTRY_LENGTH - len(prefix))
+        assert _validate_peer_card_entry(prefix + body) is True
+
+    def test_allowed_prefixes_constant_is_complete(self):
+        # Guard against silent drift between the prompt and the validator.
+        assert PEER_CARD_ALLOWED_PREFIXES == (
+            "IDENTITY:",
+            "ATTRIBUTE:",
+            "RELATIONSHIP:",
+            "INSTRUCTION:",
+        )
 
 
 @pytest.mark.asyncio

@@ -11,9 +11,12 @@ from src import models, schemas
 from src.config import settings
 from src.dependencies import tracked_db
 from src.embedding_client import embedding_client
+from src.exceptions import VectorStoreError
+from src.telemetry.events import EmbeddingCallPurpose
 from src.utils.filter import apply_filter
 from src.utils.formatting import ILIKE_ESCAPE_CHAR, escape_ilike_pattern
-from src.vector_store import VectorRecord, get_external_vector_store, upsert_with_retry
+from src.utils.types import embedding_call_purpose
+from src.vector_store import VectorRecord, get_external_vector_store
 
 from .session import get_or_create_session
 
@@ -139,13 +142,12 @@ async def _build_merged_snippets(
     for msg in matched_messages:
         session_matches.setdefault(msg.session_name, []).append(msg)
 
-    snippets: list[tuple[list[models.Message], list[models.Message]]] = []
-
+    # Build merged ranges per session, then issue a single batched query
+    session_ranges: dict[str, list[tuple[int, int, list[models.Message]]]] = {}
     for sess_name, matches in session_matches.items():
         matches.sort(key=lambda m: m.seq_in_session)
 
         merged_ranges: list[tuple[int, int, list[models.Message]]] = []
-
         for match in matches:
             start = match.seq_in_session - context_window
             end = match.seq_in_session + context_window
@@ -160,25 +162,42 @@ async def _build_merged_snippets(
             else:
                 merged_ranges.append((start, end, [match]))
 
-        # Batch all ranges into a single query using OR conditions.
-        # NOTE: If callers ever pass a very high limit (many disjoint ranges),
-        # consider chunking to avoid oversized SQL / planner issues.
-        range_conditions = [
-            models.Message.seq_in_session.between(start_seq, end_seq)
-            for start_seq, end_seq, _ in merged_ranges
-        ]
-        context_stmt = (
-            select(models.Message)
-            .where(models.Message.workspace_name == workspace_name)
-            .where(models.Message.session_name == sess_name)
-            .where(or_(*range_conditions))
-            .order_by(models.Message.seq_in_session.asc())
+        session_ranges[sess_name] = merged_ranges
+
+    # One OR-of-ANDs predicate covers every (session, range) pair
+    session_predicates = [
+        and_(
+            models.Message.session_name == sess_name,
+            or_(
+                *(
+                    models.Message.seq_in_session.between(start_seq, end_seq)
+                    for start_seq, end_seq, _ in merged_ranges
+                )
+            ),
         )
+        for sess_name, merged_ranges in session_ranges.items()
+    ]
 
-        context_result = await db.execute(context_stmt)
-        all_context_messages = list(context_result.scalars().all())
+    context_stmt = (
+        select(models.Message)
+        .where(models.Message.workspace_name == workspace_name)
+        .where(or_(*session_predicates))
+        .order_by(
+            models.Message.session_name.asc(),
+            models.Message.seq_in_session.asc(),
+        )
+    )
 
-        # Partition results back into their respective ranges
+    context_result = await db.execute(context_stmt)
+    by_session: dict[str, list[models.Message]] = {}
+    for msg in context_result.scalars().all():
+        by_session.setdefault(msg.session_name, []).append(msg)
+
+    snippets: list[
+        tuple[list[models.Message], list[models.Message]]
+    ] = []  # list of tuples, each containing query matches and context messages
+    for sess_name, merged_ranges in session_ranges.items():
+        all_context_messages = by_session.get(sess_name, [])
         for start_seq, end_seq, range_matches in merged_ranges:
             context_messages = [
                 msg
@@ -261,18 +280,22 @@ async def create_messages(
     await db.commit()
     try:
         if settings.EMBED_MESSAGES:
-            encoded_message_lookup = {
-                msg.public_id: orig_msg.encoded_message
-                for msg, orig_msg in zip(message_objects, messages, strict=True)
-            }
             id_resource_dict = {
-                message.public_id: (
-                    message.content,
-                    encoded_message_lookup[message.public_id],
-                )
+                message.public_id: message.content
                 for message in message_objects
+                if message.content and message.content.strip()
             }
-            embedding_dict = await embedding_client.batch_embed(id_resource_dict)
+            if id_resource_dict:
+                with embedding_call_purpose(
+                    EmbeddingCallPurpose.MESSAGE_CREATE.value,
+                    workspace_name=workspace_name,
+                    parent_category="api",
+                ):
+                    embedding_dict = await embedding_client.batch_embed(
+                        id_resource_dict
+                    )
+            else:
+                embedding_dict = {}
 
             external_vector_store = get_external_vector_store()
 
@@ -349,11 +372,11 @@ async def create_messages(
                         )
                     )
 
-                # Upsert to external vector store with retry and update sync state
+                # Upsert to external vector store and update sync state
                 if vector_records:
                     try:
-                        await upsert_with_retry(
-                            external_vector_store, namespace, vector_records
+                        await external_vector_store.upsert_many(
+                            namespace, vector_records
                         )
                         # Success: mark as synced if we have DB rows
                         if embedding_ids:
@@ -368,11 +391,24 @@ async def create_messages(
                             )
                             await db.commit()
 
-                    except Exception:
-                        # Failed after retries - increment sync_attempts for reconciliation
-                        logger.exception(
-                            "Failed to upsert message vectors after retries"
+                    except VectorStoreError:
+                        logger.warning(
+                            "Vector store unavailable; leaving message vectors unsynced"
                         )
+                        if embedding_ids:
+                            await db.execute(
+                                update(models.MessageEmbedding)
+                                .where(models.MessageEmbedding.id.in_(embedding_ids))
+                                .values(
+                                    sync_attempts=models.MessageEmbedding.sync_attempts
+                                    + 1,
+                                    last_sync_at=func.now(),
+                                )
+                            )
+                            await db.commit()
+
+                    except Exception:
+                        logger.exception("Unexpected error upserting message vectors")
                         if embedding_ids:
                             await db.execute(
                                 update(models.MessageEmbedding)
@@ -666,6 +702,7 @@ async def _search_messages_external(
         query_embedding,
         top_k=limit * oversample,
         filters=vector_filters if vector_filters else None,
+        include_attributes=["message_id"],
     )
 
     if not vector_results:
@@ -862,9 +899,17 @@ async def search_messages(
         Each snippet may contain multiple matches if they were close together.
         Context messages are ordered chronologically and include the matched messages.
     """
-    query_embedding = (
-        embedding if embedding is not None else await embedding_client.embed(query)
-    )
+    if embedding is not None:
+        query_embedding = embedding
+    else:
+        # Caller didn't precompute; tag this fallback path as search_messages.
+        # Callers that have a more specific intent should set their own
+        # context manager before calling and pass the precomputed embedding.
+        with embedding_call_purpose(
+            EmbeddingCallPurpose.SEARCH_MESSAGES.value,
+            workspace_name=workspace_name,
+        ):
+            query_embedding = await embedding_client.embed(query)
     return await _semantic_search_messages(
         workspace_name,
         session_name,
@@ -1054,9 +1099,17 @@ async def search_messages_temporal(
         List of tuples: (matched_messages, context_messages)
         Each snippet may contain multiple matches if they were close together.
     """
-    query_embedding = (
-        embedding if embedding is not None else await embedding_client.embed(query)
-    )
+    if embedding is not None:
+        query_embedding = embedding
+    else:
+        # Caller didn't precompute; tag this fallback path as search_messages.
+        # Callers that have a more specific intent should set their own
+        # context manager before calling and pass the precomputed embedding.
+        with embedding_call_purpose(
+            EmbeddingCallPurpose.SEARCH_MESSAGES.value,
+            workspace_name=workspace_name,
+        ):
+            query_embedding = await embedding_client.embed(query)
     return await _semantic_search_messages(
         workspace_name,
         session_name,

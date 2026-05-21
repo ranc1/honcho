@@ -20,17 +20,254 @@ from src.telemetry.events import (
     AgentToolConclusionsCreatedEvent,
     AgentToolConclusionsDeletedEvent,
     AgentToolPeerCardUpdatedEvent,
+    EmbeddingCallPurpose,
     emit,
 )
 from src.utils import summarizer
 from src.utils.formatting import format_new_turn_with_timestamp, utc_now_iso
 from src.utils.representation import Representation
-from src.utils.types import get_current_iteration
+from src.utils.types import ToolResult, embedding_call_purpose, get_current_iteration
 
 logger = logging.getLogger(__name__)
 
 # Hard cap to prevent unbounded peer card growth from repeated agent updates.
 MAX_PEER_CARD_FACTS = 40
+
+# Identity-marker prefixes allowed on the peer card. Anything else is rejected
+# structurally — see `_validate_peer_card_entry`.
+PEER_CARD_ALLOWED_PREFIXES: tuple[str, ...] = (
+    "IDENTITY:",
+    "ATTRIBUTE:",
+    "RELATIONSHIP:",
+    "INSTRUCTION:",
+)
+
+# Per-entry character cap to block evidence-bundle dumps and runaway lines.
+MAX_PEER_CARD_ENTRY_LENGTH = 200
+
+
+def _validate_peer_card_entry(line: str) -> bool:
+    """Structural validation for a single peer card entry.
+
+    Returns True when the line starts with one of the allowed prefixes followed
+    by a space, has a non-empty body after the prefix, and fits within the per-
+    entry length cap. Subject-substance correctness (is this actually about the
+    observed peer?) is left to the prompt — this is form-only.
+    """
+    if not line or len(line) > MAX_PEER_CARD_ENTRY_LENGTH:
+        return False
+    for prefix in PEER_CARD_ALLOWED_PREFIXES:
+        prefix_with_space = f"{prefix} "
+        if line.startswith(prefix_with_space):
+            body = line[len(prefix_with_space) :].strip()
+            return bool(body)
+    return False
+
+
+def _normalized_observation_input(
+    obs: schemas.ObservationInput,
+) -> schemas.ObservationInput:
+    """Return an observation input with content normalized for persistence/embedding."""
+    return obs.model_copy(update={"content": obs.content.strip()})
+
+
+def _base_observation_properties() -> dict[str, Any]:
+    return {
+        "content": {
+            "type": "string",
+            "description": "The observation content",
+        },
+        "level": {
+            "type": "string",
+            "enum": [
+                "explicit",
+                "deductive",
+                "inductive",
+                "contradiction",
+            ],
+            "description": (
+                "Level: 'explicit' for direct facts, 'deductive' for logical "
+                + "necessities, 'inductive' for patterns, 'contradiction' for "
+                + "conflicting statements"
+            ),
+        },
+        "source_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Document IDs of source or premise observations. Required and "
+                + "must be non-empty for deductive, inductive, and contradiction "
+                + "observations."
+            ),
+        },
+        "premises": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "(For deductive) Human-readable premise text for display",
+        },
+        "sources": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "(For inductive/contradiction) Human-readable source text for display",
+        },
+        "pattern_type": {
+            "type": "string",
+            "enum": [
+                "preference",
+                "behavior",
+                "personality",
+                "tendency",
+                "correlation",
+            ],
+            "description": "(For inductive only) Type of pattern being identified",
+        },
+        "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": (
+                "(For inductive only) Confidence level: 'high' for 5+ sources, "
+                + "'medium' for 3-4, 'low' for 2"
+            ),
+        },
+    }
+
+
+def _generic_observation_item_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": _base_observation_properties(),
+        "required": ["content", "level"],
+        "additionalProperties": False,
+        "allOf": [
+            {
+                "if": {"properties": {"level": {"const": "deductive"}}},
+                "then": {
+                    "required": ["source_ids", "premises"],
+                    "properties": {
+                        "source_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
+                        "premises": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
+                    },
+                },
+            },
+            {
+                "if": {"properties": {"level": {"const": "inductive"}}},
+                "then": {
+                    "required": [
+                        "source_ids",
+                        "sources",
+                        "pattern_type",
+                        "confidence",
+                    ],
+                    "properties": {
+                        "source_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 2,
+                        },
+                        "sources": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 2,
+                        },
+                    },
+                },
+            },
+            {
+                "if": {"properties": {"level": {"const": "contradiction"}}},
+                "then": {
+                    "required": ["source_ids", "sources"],
+                    "properties": {
+                        "source_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 2,
+                        },
+                        "sources": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 2,
+                        },
+                    },
+                },
+            },
+        ],
+    }
+
+
+def _deductive_observation_item_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The deductive conclusion as a self-contained statement",
+            },
+            "source_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "Required non-empty list of source observation IDs supporting the deduction",
+            },
+            "premises": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "Required human-readable premise text matching the source observations",
+            },
+        },
+        "required": ["content", "source_ids", "premises"],
+        "additionalProperties": False,
+    }
+
+
+def _inductive_observation_item_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The inductive pattern or generalization as a self-contained statement",
+            },
+            "source_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "description": "Required list of at least two source observation IDs supporting the pattern",
+            },
+            "sources": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "description": "Required human-readable evidence text matching the source observations",
+            },
+            "pattern_type": {
+                "type": "string",
+                "enum": [
+                    "preference",
+                    "behavior",
+                    "personality",
+                    "tendency",
+                    "correlation",
+                ],
+                "description": "Required pattern category",
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+                "description": "Required confidence level based on evidence count",
+            },
+        },
+        "required": ["content", "source_ids", "sources", "pattern_type", "confidence"],
+        "additionalProperties": False,
+    }
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -107,16 +344,46 @@ class ObservationsCreatedResult:
     failed: list[ObservationFailure]
 
 
-def _truncate_tool_output(output: str, max_chars: int | None = None) -> str:
-    """Truncate tool output to prevent token explosion."""
+def _truncate_tool_output(
+    output: str, max_chars: int | None = None
+) -> tuple[str, int, bool]:
+    """Truncate tool output to prevent token explosion.
+
+    Returns (text, original_chars, was_truncated). Callers thread the
+    truncation signal into `ToolResult.metadata` so
+    `AgentToolCallCompletedEvent` can report `was_truncated` and
+    `result_chars_before_truncation` instead of always emitting them as
+    None/False.
+    """
     if max_chars is None:
         max_chars = settings.LLM.MAX_TOOL_OUTPUT_CHARS
-    if len(output) <= max_chars:
-        return output
-    truncated = output[:max_chars]
-    return (
-        truncated
-        + f"\n\n[OUTPUT TRUNCATED - showing {max_chars:,} of {len(output):,} characters]"
+    original_chars = len(output)
+    if original_chars <= max_chars:
+        return output, original_chars, False
+    truncated = (
+        output[:max_chars]
+        + f"\n\n[OUTPUT TRUNCATED - showing {max_chars:,} of {original_chars:,} characters]"
+    )
+    return truncated, original_chars, True
+
+
+def _maybe_truncated_result(output: str) -> "str | ToolResult":
+    """Run `_truncate_tool_output` and wrap in `ToolResult` only when the
+    output was actually clamped, so the truncation signal reaches the
+    `AgentToolCallCompletedEvent` emitter (which reads `was_truncated` /
+    `result_chars_before_truncation` from `ToolResult.metadata`). Returns a
+    bare `str` in the common no-truncation case to keep the handler
+    contract unchanged.
+    """
+    content, original_chars, was_truncated = _truncate_tool_output(output)
+    if not was_truncated:
+        return content
+    return ToolResult(
+        content=content,
+        metadata={
+            "was_truncated": True,
+            "result_chars_before_truncation": original_chars,
+        },
     )
 
 
@@ -177,88 +444,44 @@ def _extract_pattern_snippet(
 TOOLS: dict[str, dict[str, Any]] = {
     "create_observations": {
         "name": "create_observations",
-        "description": "Create observations at any level: explicit (facts), deductive (logical necessities), inductive (patterns), or contradiction (conflicting statements). Use this to record facts, logical inferences, patterns, or note when the user has said contradictory things.",
+        "description": "Create observations at any level: explicit (facts), deductive (logical necessities), inductive (patterns), or contradiction (conflicting statements). For deductive, inductive, and contradiction observations, missing or empty source_ids are invalid and will be rejected.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "observations": {
                     "type": "array",
                     "description": "List of observations to create",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "The observation content",
-                            },
-                            "level": {
-                                "type": "string",
-                                "enum": [
-                                    "explicit",
-                                    "deductive",
-                                    "inductive",
-                                    "contradiction",
-                                ],
-                                "description": "Level: 'explicit' for direct facts, 'deductive' for logical necessities, 'inductive' for patterns, 'contradiction' for conflicting statements",
-                            },
-                            "source_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "(For deductive/inductive/contradiction) Document IDs of source/premise observations - REQUIRED",
-                            },
-                            "premises": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "(For deductive) Human-readable premise text for display",
-                            },
-                            "sources": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "(For inductive/contradiction) Human-readable source text for display",
-                            },
-                            "pattern_type": {
-                                "type": "string",
-                                "enum": [
-                                    "preference",
-                                    "behavior",
-                                    "personality",
-                                    "tendency",
-                                    "correlation",
-                                ],
-                                "description": "(For inductive only) Type of pattern being identified",
-                            },
-                            "confidence": {
-                                "type": "string",
-                                "enum": ["high", "medium", "low"],
-                                "description": "(For inductive only) Confidence level: 'high' for 3+ sources, 'medium' for 2+, 'low' for tentative",
-                            },
-                        },
-                        "required": ["content", "level"],
-                    },
+                    "items": _generic_observation_item_schema(),
                 },
             },
             "required": ["observations"],
         },
     },
     "create_observations_deductive": {
-        "name": "create_observations",
-        "description": "Create new deductive observations discovered while answering the query. Use this when you infer something new about the peer that isn't already captured in existing observations. Only use for novel deductions - not for restating existing facts.",
+        "name": "create_observations_deductive",
+        "description": "Create new deductive observations discovered while answering the query. Every observation must include non-empty source_ids and premise text. Use this only for novel deductions grounded in existing observations.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "observations": {
                     "type": "array",
                     "description": "List of new deductive observations to create",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "The observation content - should be a self-contained statement about the peer",
-                            },
-                        },
-                        "required": ["content"],
-                    },
+                    "items": _deductive_observation_item_schema(),
+                },
+            },
+            "required": ["observations"],
+        },
+    },
+    "create_observations_inductive": {
+        "name": "create_observations_inductive",
+        "description": "Create new inductive observations discovered while answering the query. Every observation must include source_ids, source text, pattern_type, and confidence. Use this only for patterns supported by multiple observations.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "observations": {
+                    "type": "array",
+                    "description": "List of new inductive observations to create",
+                    "items": _inductive_observation_item_schema(),
                 },
             },
             "required": ["observations"],
@@ -267,9 +490,16 @@ TOOLS: dict[str, dict[str, Any]] = {
     "update_peer_card": {
         "name": "update_peer_card",
         "description": (
-            "Update the peer card with durable profile facts about the observed peer. "
-            + "Only include stable biographical facts, standing instructions, and long-lived preferences/traits. "
-            + "Do not include one-off conclusions, temporary events, or duplicate entries."
+            "Update the peer card with stable identity markers about the observed peer. "
+            "An identity marker distinguishes the peer from others of its kind and persists across interactions. "
+            "The peer may be any entity with identity that changes over time (human, agent, codebase, team, organization) — do not assume the peer is human. "
+            "Each entry must start with one of four prefixes: `IDENTITY:` (canonical name, kind, aliases, IDs), "
+            "`ATTRIBUTE:` (stable durable property, including explicitly stated standing preferences), "
+            "`RELATIONSHIP:` (durable link to another entity), or "
+            "`INSTRUCTION:` (standing rule of engagement the peer has explicitly stated). "
+            "Do not write `TRAIT:` or behavioral `PREFERENCE:` entries, one-off observations, transient state, "
+            "inferred facts not directly supported by evidence, evidence bundles / `e.g.` clauses, or entries about co-occurring peers. "
+            "Entries without an allowed prefix or that exceed the per-entry length cap are rejected."
         ),
         "input_schema": {
             "type": "object",
@@ -278,7 +508,9 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "array",
                     "description": (
                         "Complete deduplicated peer card list (max 40 entries). "
-                        + "Each entry should be a concise standalone profile fact."
+                        "Each entry must start with one of the allowed prefixes "
+                        "(`IDENTITY: `, `ATTRIBUTE: `, `RELATIONSHIP: `, `INSTRUCTION: `) "
+                        "followed by one concise identity marker. Entries without an allowed prefix are rejected."
                     ),
                     "items": {"type": "string"},
                 },
@@ -595,7 +827,7 @@ DEDUCTION_SPECIALIST_TOOLS: list[dict[str, Any]] = [
     TOOLS["search_memory"],
     TOOLS["search_messages"],
     # Action tools
-    TOOLS["create_observations"],
+    TOOLS["create_observations_deductive"],
     TOOLS["delete_observations"],
     TOOLS["update_peer_card"],
 ]
@@ -603,15 +835,14 @@ DEDUCTION_SPECIALIST_TOOLS: list[dict[str, Any]] = [
 # Tools for the induction specialist (dreamer phase 2)
 # Creates inductive observations from explicit and deductive observations
 # Includes message access for context and self-directed exploration
-# Note: get_peer_card is not included - peer card is injected into the prompt directly
+# Induction does not write to the peer card — that is deduction's responsibility.
 INDUCTION_SPECIALIST_TOOLS: list[dict[str, Any]] = [
     # Discovery tools
     TOOLS["get_recent_observations"],
     TOOLS["search_memory"],
     TOOLS["search_messages"],
     # Action tools
-    TOOLS["create_observations"],
-    TOOLS["update_peer_card"],
+    TOOLS["create_observations_inductive"],
 ]
 
 
@@ -623,6 +854,8 @@ async def create_observations(
     workspace_name: str,
     message_ids: list[int],
     message_created_at: str,
+    run_id: str | None = None,
+    parent_category: str | None = None,
 ) -> ObservationsCreatedResult:
     """
     Create multiple observations (documents) in the memory system in a single call.
@@ -637,6 +870,9 @@ async def create_observations(
         workspace_name: Workspace identifier
         message_ids: List of message IDs these observations are based on
         message_created_at: Timestamp of the message that triggered these observations
+        run_id: Agent run id, threaded onto the embedding-call ContextVar so
+            EmbeddingCallCompletedEvents emitted here can be joined back to
+            the originating agent run.
 
     Returns:
         ObservationsCreatedResult with created count and any per-observation failures
@@ -645,7 +881,16 @@ async def create_observations(
         logger.warning("create_observations called with empty list")
         return ObservationsCreatedResult(created_count=0, created_levels=[], failed=[])
 
-    # Phase 1: Ensure collection exists (short DB scope)
+    normalized_observations = [
+        _normalized_observation_input(obs)
+        for obs in observations
+        if obs.content.strip()
+    ]
+    if not normalized_observations:
+        logger.info("No non-empty observations to create")
+        return ObservationsCreatedResult(created_count=0, created_levels=[], failed=[])
+
+    # Ensure collection exists (short DB scope)
     async with tracked_db("create_observations.collection") as db:
         await crud.get_or_create_collection(
             db,
@@ -654,13 +899,19 @@ async def create_observations(
             observed=observed,
         )
 
-    # Phase 2: Compute embeddings (no DB needed)
-    contents = [obs.content for obs in observations]
+    # Compute embeddings (no DB needed)
+    contents = [obs.content for obs in normalized_observations]
     embeddings_by_index: dict[int, list[float]] | None = None
     try:
-        embeddings = await embedding_client.simple_batch_embed(contents)
+        with embedding_call_purpose(
+            EmbeddingCallPurpose.CREATE_OBSERVATIONS.value,
+            workspace_name=workspace_name,
+            run_id=run_id,
+            parent_category=parent_category,
+        ):
+            embeddings = await embedding_client.simple_batch_embed(contents)
         embeddings_by_index = dict(
-            zip(range(len(observations)), embeddings, strict=True)
+            zip(range(len(normalized_observations)), embeddings, strict=True)
         )
     except Exception as e:
         logger.warning(
@@ -671,13 +922,19 @@ async def create_observations(
     # Build document objects with pre-computed embeddings
     documents: list[schemas.DocumentCreate] = []
     failed: list[ObservationFailure] = []
-    for i, obs in enumerate(observations):
+    for i, obs in enumerate(normalized_observations):
         embedding: list[float]
         if embeddings_by_index is not None:
             embedding = embeddings_by_index[i]
         else:
             try:
-                embedding = await embedding_client.embed(obs.content)
+                with embedding_call_purpose(
+                    EmbeddingCallPurpose.CREATE_OBSERVATIONS.value,
+                    workspace_name=workspace_name,
+                    run_id=run_id,
+                    parent_category=parent_category,
+                ):
+                    embedding = await embedding_client.embed(obs.content)
             except Exception as e:
                 logger.warning(
                     "Error embedding observation content for level '%s': %s",
@@ -721,7 +978,7 @@ async def create_observations(
         )
         documents.append(doc)
 
-    # Phase 3: Bulk create all documents (short DB scope)
+    # Bulk create all documents (short DB scope)
     accepted: list[schemas.DocumentCreate] = []
     if documents:
         async with tracked_db("create_observations.save") as db:
@@ -1033,9 +1290,12 @@ class ToolContext:
     parent_category: str | None = None  # Parent category for CloudEvents
 
 
-async def _handle_create_observations(
-    ctx: ToolContext, tool_input: dict[str, Any]
-) -> str:
+async def _handle_create_observations_impl(
+    ctx: ToolContext,
+    tool_input: dict[str, Any],
+    *,
+    forced_level: str | None = None,
+) -> "str | ToolResult":
     """Handle create_observations tool."""
     raw_observations = tool_input.get("observations", [])
 
@@ -1045,7 +1305,10 @@ async def _handle_create_observations(
     # Set context-specific default level before Pydantic validation
     default_level = "explicit" if ctx.current_messages else "deductive"
     for obs in raw_observations:
-        obs.setdefault("level", default_level)
+        if forced_level is not None:
+            obs["level"] = forced_level
+        else:
+            obs.setdefault("level", default_level)
 
     # Validate observations individually so valid ones are still processed
     observations: list[schemas.ObservationInput] = []
@@ -1096,6 +1359,8 @@ async def _handle_create_observations(
             workspace_name=ctx.workspace_name,
             message_ids=message_ids,
             message_created_at=message_created_at,
+            run_id=ctx.run_id,
+            parent_category=ctx.parent_category,
         )
 
     # Merge validation and embedding failures
@@ -1136,10 +1401,47 @@ async def _handle_create_observations(
         )
         response += f"\nFailed {len(all_failures)}: {failure_details}"
 
-    return response
+    # +5: surface created_count so DreamSpecialistEvent can sum actual
+    # observations across the run rather than just counting create_observations
+    # calls (which would conflate "1 call that made 5 observations" with
+    # "5 calls that each made 1").
+    from src.utils.types import ToolResult
+
+    return ToolResult(
+        content=response,
+        metadata={"created_count": result.created_count, "levels": levels},
+    )
 
 
-async def _handle_update_peer_card(ctx: ToolContext, tool_input: dict[str, Any]) -> str:
+async def _handle_create_observations(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
+    return await _handle_create_observations_impl(ctx, tool_input)
+
+
+async def _handle_create_observations_deductive(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
+    return await _handle_create_observations_impl(
+        ctx,
+        tool_input,
+        forced_level="deductive",
+    )
+
+
+async def _handle_create_observations_inductive(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
+    return await _handle_create_observations_impl(
+        ctx,
+        tool_input,
+        forced_level="inductive",
+    )
+
+
+async def _handle_update_peer_card(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
     """Handle update_peer_card tool."""
     # Check if peer card creation is disabled via configuration
     if ctx.configuration is not None and not ctx.configuration.peer_card.create:
@@ -1161,9 +1463,16 @@ async def _handle_update_peer_card(ctx: ToolContext, tool_input: dict[str, Any])
         )
         return "Peer card content was empty, no update performed."
 
-    # Normalize and deduplicate to keep peer cards bounded and stable.
+    # Normalize, validate structure, and deduplicate to keep peer cards bounded
+    # and on-spec.
     normalized_peer_card: list[str] = []
     seen: set[str] = set()
+    rejected_count = 0
+    # Keep a small sample of rejected entries to surface back to the model so it
+    # can self-correct on a retry. Capped to avoid bloating the tool response.
+    rejected_samples: list[str] = []
+    _REJECTED_SAMPLE_CAP = 3
+    _REJECTED_SAMPLE_LINE_LIMIT = 120
     items = (
         cast(list[str], raw_peer_card_content)
         if isinstance(raw_peer_card_content, list)
@@ -1174,6 +1483,16 @@ async def _handle_update_peer_card(ctx: ToolContext, tool_input: dict[str, Any])
         if not line:
             continue
 
+        if not _validate_peer_card_entry(line):
+            rejected_count += 1
+            if len(rejected_samples) < _REJECTED_SAMPLE_CAP:
+                rejected_samples.append(line[:_REJECTED_SAMPLE_LINE_LIMIT])
+            logger.info(
+                "Rejecting peer card entry (no allowed prefix, empty body, or over length cap): %r",
+                line[:80],
+            )
+            continue
+
         # Case-insensitive dedupe with whitespace normalization.
         normalized_key = " ".join(line.lower().split())
         if normalized_key in seen:
@@ -1181,12 +1500,44 @@ async def _handle_update_peer_card(ctx: ToolContext, tool_input: dict[str, Any])
         seen.add(normalized_key)
         normalized_peer_card.append(line)
 
-    # Don't clear the peer card if all content normalized to empty.
+    if rejected_count:
+        logger.info(
+            "Peer card update for %s/%s/%s rejected %d structurally invalid entries",
+            ctx.workspace_name,
+            ctx.observer,
+            ctx.observed,
+            rejected_count,
+        )
+
+    def _format_rejection_feedback(scope: str) -> str:
+        """Build a self-correction hint for the model. `scope` is grammar glue:
+        either "all" (every entry rejected) or e.g. "3 of 12" (partial)."""
+        samples_block = ""
+        if rejected_samples:
+            sample_lines = "\n".join(f"  - {s!r}" for s in rejected_samples)
+            extra = (
+                f" (+{rejected_count - len(rejected_samples)} more)"
+                if rejected_count > len(rejected_samples)
+                else ""
+            )
+            samples_block = f" Examples of rejected entries{extra}:\n{sample_lines}"
+        return (
+            f"Rejected {scope} entries for failing structural validation. "
+            "Each entry must start with one of `IDENTITY: `, `ATTRIBUTE: `, "
+            "`RELATIONSHIP: `, or `INSTRUCTION: ` and stay under the per-entry "
+            f"length cap.{samples_block}"
+        )
+
+    # Don't clear the peer card if all content normalized to empty or every
+    # entry was structurally invalid.
     if not normalized_peer_card:
         logger.warning(
-            "Peer card update normalized to empty for %s, keeping existing card",
+            "Peer card update normalized to empty for %s (rejected=%d), keeping existing card",
             ctx.workspace_name,
+            rejected_count,
         )
+        if rejected_count:
+            return _format_rejection_feedback(f"all {rejected_count}")
         return "Peer card content was empty after normalization, no update performed."
 
     if len(normalized_peer_card) > MAX_PEER_CARD_FACTS:
@@ -1226,12 +1577,34 @@ async def _handle_update_peer_card(ctx: ToolContext, tool_input: dict[str, Any])
             )
         )
 
-    return f"Updated peer card for {ctx.observed} by {ctx.observer}"
+    # signal a successful peer_card update so DreamSpecialistEvent
+    # can set its `peer_card_updated` flag without name-counting.
+    from src.utils.types import ToolResult
+
+    success_content = (
+        f"Updated peer card for {ctx.observed} by {ctx.observer} "
+        f"with {len(normalized_peer_card)} entries."
+    )
+    if rejected_count:
+        # Partial reject: surface the rejection so the model can re-emit the
+        # dropped entries (with correct prefixes) on a retry instead of
+        # silently losing them.
+        accepted = len(normalized_peer_card)
+        total = accepted + rejected_count
+        success_content = f"{success_content} {_format_rejection_feedback(f'{rejected_count} of {total}')}"
+    return ToolResult(
+        content=success_content,
+        metadata={
+            "peer_card_updated": True,
+            "facts_count": len(normalized_peer_card),
+            "rejected_count": rejected_count,
+        },
+    )
 
 
 async def _handle_get_recent_history(
     ctx: ToolContext, tool_input: dict[str, Any]
-) -> str:
+) -> "str | ToolResult":
     """Handle get_recent_history tool."""
     _ = tool_input
     async with tracked_db("tool.get_recent_history") as db:
@@ -1253,17 +1626,38 @@ async def _handle_get_recent_history(
         else f"from {ctx.observed} across sessions"
     )
     output = f"Conversation history ({len(history)} messages {scope}):\n{history_text}"
-    return _truncate_tool_output(output)
+    return _maybe_truncated_result(output)
 
 
-async def _handle_search_memory(ctx: ToolContext, tool_input: dict[str, Any]) -> str:
+async def _handle_search_memory(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
     """Handle search_memory tool."""
+    from src.utils.types import ToolResult
+
     top_k = min(_safe_int(tool_input.get("top_k"), 20), 40)
     query = tool_input["query"]
     try:
-        query_embedding = await embedding_client.embed(query)
+        with embedding_call_purpose(
+            EmbeddingCallPurpose.SEARCH_MEMORY.value,
+            workspace_name=ctx.workspace_name,
+            run_id=ctx.run_id,
+            parent_category=ctx.parent_category,
+        ):
+            query_embedding = await embedding_client.embed(query)
     except ValueError:
-        return f"ERROR: Query exceeds maximum token limit of {settings.MAX_EMBEDDING_TOKENS}. Please use a shorter query."
+        return (
+            "ERROR: Query exceeds maximum token limit of "
+            + f"{settings.EMBEDDING.MAX_INPUT_TOKENS}. Please use a shorter query."
+        )
+
+    # Base telemetry metadata; results_count gets filled in below.
+    search_meta: dict[str, Any] = {
+        "top_k": top_k,
+        "used_embedding": True,
+        "embedding_query_count": 1,
+        "query_tokens": _estimate_tokens_safe(query),
+    }
 
     documents = await crud.query_documents(
         db=None,
@@ -1277,11 +1671,13 @@ async def _handle_search_memory(ctx: ToolContext, tool_input: dict[str, Any]) ->
     mem = Representation.from_documents(documents)
     total_count = mem.len()
     if total_count == 0:
-        # fallback behavior: if the memory is *empty*, that means we're quite
-        # early in a workspace/peer/session -- in order to give good answers in
-        # this stage, and be efficient with tool calls, and make sure the model
-        # doesn't short-circuit and think there's nothing here, we
-        # automatically search the message history for relevant information.
+        # Empty-memory fallback: if the memory is *empty*, that means we're
+        # quite early in a workspace/peer/session -- in order to give good
+        # answers in this stage, and be efficient with tool calls, and make
+        # sure the model doesn't short-circuit and think there's nothing
+        # here, we automatically search the message history for relevant
+        # information.
+        zero_hit_meta = {**search_meta, "results_count": 0}
         if ctx.agent_type == "dialectic":
             limit = min(_safe_int(tool_input.get("top_k"), 20), 20)
             message_output = None
@@ -1299,21 +1695,33 @@ async def _handle_search_memory(ctx: ToolContext, tool_input: dict[str, Any]) ->
                     snippets, f"for query '{query}'"
                 )
             if message_output:
-                return (
-                    f"No observations yet. Message search results:\n\n{message_output}"
+                fallback_meta = {**zero_hit_meta, "results_count": len(snippets)}
+                return ToolResult(
+                    content=f"No observations yet. Message search results:\n\n{message_output}",
+                    metadata=fallback_meta,
                 )
-            return (
-                f"No observations found for query '{query}', and no messages found in "
-                "history. Try a different phrasing or use grep_messages for exact text."
+            return ToolResult(
+                content=(
+                    f"No observations found for query '{query}', and no messages found in "
+                    "history. Try a different phrasing or use grep_messages for exact text."
+                ),
+                metadata=zero_hit_meta,
             )
-        return f"No observations found for query '{query}'"
+        return ToolResult(
+            content=f"No observations found for query '{query}'",
+            metadata=zero_hit_meta,
+        )
     mem_str = mem.str_with_ids() if ctx.include_observation_ids else str(mem)
-    return f"Found {total_count} observations for query '{query}':\n\n{mem_str}"
+    search_meta["results_count"] = total_count
+    return ToolResult(
+        content=f"Found {total_count} observations for query '{query}':\n\n{mem_str}",
+        metadata=search_meta,
+    )
 
 
 async def _handle_get_observation_context(
     ctx: ToolContext, tool_input: dict[str, Any]
-) -> str:
+) -> "str | ToolResult":
     """Handle get_observation_context tool."""
     async with tracked_db("tool.get_observation_context") as db:
         messages = await get_observation_context(
@@ -1336,16 +1744,26 @@ async def _handle_get_observation_context(
             ]
         )
     output = f"Retrieved {len(messages)} messages with context:\n{messages_text}"
-    return _truncate_tool_output(output)
+    return _maybe_truncated_result(output)
 
 
-async def _handle_search_messages(ctx: ToolContext, tool_input: dict[str, Any]) -> str:
+async def _handle_search_messages(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
     """Handle search_messages tool."""
+    from src.utils.types import ToolResult
+
     query = tool_input["query"]
     limit = min(_safe_int(tool_input.get("limit"), 10), 20)  # Cap at 20
     # Pre-compute embedding outside DB session to avoid holding a connection
     # during the external API call (same pattern as _handle_search_memory).
-    query_embedding = await embedding_client.embed(query)
+    with embedding_call_purpose(
+        EmbeddingCallPurpose.SEARCH_MESSAGES.value,
+        workspace_name=ctx.workspace_name,
+        run_id=ctx.run_id,
+        parent_category=ctx.parent_category,
+    ):
+        query_embedding = await embedding_client.embed(query)
     snippets = await crud.search_messages(
         workspace_name=ctx.workspace_name,
         session_name=ctx.session_name,
@@ -1355,13 +1773,25 @@ async def _handle_search_messages(ctx: ToolContext, tool_input: dict[str, Any]) 
         embedding=query_embedding,
         observer=ctx.observer,
     )
+    search_meta: dict[str, Any] = {
+        "top_k": limit,
+        "used_embedding": True,
+        "embedding_query_count": 1,
+        "query_tokens": _estimate_tokens_safe(query),
+        "results_count": len(snippets),
+    }
     if not snippets:
-        return f"No messages found for query '{query}'"
+        return ToolResult(
+            content=f"No messages found for query '{query}'",
+            metadata=search_meta,
+        )
     formatted = _format_message_snippets(snippets, f"for query '{query}'")
-    return formatted
+    return ToolResult(content=formatted, metadata=search_meta)
 
 
-async def _handle_grep_messages(ctx: ToolContext, tool_input: dict[str, Any]) -> str:
+async def _handle_grep_messages(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
     """Handle grep_messages tool."""
     text = tool_input.get("text", "")
     if not text:
@@ -1402,7 +1832,7 @@ async def _handle_grep_messages(ctx: ToolContext, tool_input: dict[str, Any]) ->
         f"Found {total_matches} messages containing '{text}' in {len(snippets)} conversation snippets:\n\n"
         + "\n\n".join(snippet_texts)
     )
-    return _truncate_tool_output(output)
+    return _maybe_truncated_result(output)
 
 
 def _parse_date(date_str: str | None, param_name: str) -> datetime | None | str:
@@ -1417,7 +1847,7 @@ def _parse_date(date_str: str | None, param_name: str) -> datetime | None | str:
 
 async def _handle_get_messages_by_date_range(
     ctx: ToolContext, tool_input: dict[str, Any]
-) -> str:
+) -> "str | ToolResult":
     """Handle get_messages_by_date_range tool."""
     after_date_str = tool_input.get("after_date")
     before_date_str = tool_input.get("before_date")
@@ -1473,12 +1903,12 @@ async def _handle_get_messages_by_date_range(
     output = (
         f"Found {msg_count} messages ({range_desc}, {order_desc}):\n\n{messages_text}"
     )
-    return _truncate_tool_output(output)
+    return _maybe_truncated_result(output)
 
 
 async def _handle_search_messages_temporal(
     ctx: ToolContext, tool_input: dict[str, Any]
-) -> str:
+) -> "str | ToolResult":
     """Handle search_messages_temporal tool."""
     query = tool_input.get("query", "")
     if not query:
@@ -1499,7 +1929,13 @@ async def _handle_search_messages_temporal(
 
     # Pre-compute embedding outside DB session to avoid holding a connection
     # during the external API call.
-    query_embedding = await embedding_client.embed(query)
+    with embedding_call_purpose(
+        EmbeddingCallPurpose.SEARCH_MESSAGES.value,
+        workspace_name=ctx.workspace_name,
+        run_id=ctx.run_id,
+        parent_category=ctx.parent_category,
+    ):
+        query_embedding = await embedding_client.embed(query)
     snippets = await crud.search_messages_temporal(
         workspace_name=ctx.workspace_name,
         session_name=ctx.session_name,
@@ -1518,11 +1954,25 @@ async def _handle_search_messages_temporal(
         date_filter.append(f"before {before_date_str}")
     filter_desc = f" ({' and '.join(date_filter)})" if date_filter else ""
 
+    # Matches the search_messages metadata shape so analytics can filter
+    # AgentToolCallCompletedEvent uniformly across all embedding-backed
+    # search tools (search_memory / search_messages / search_messages_temporal).
+    search_meta: dict[str, Any] = {
+        "top_k": limit,
+        "used_embedding": True,
+        "embedding_query_count": 1,
+        "query_tokens": _estimate_tokens_safe(query),
+        "results_count": len(snippets),
+    }
+
     if not snippets:
-        return f"No messages found for query '{query}'{filter_desc}"
+        return ToolResult(
+            content=f"No messages found for query '{query}'{filter_desc}",
+            metadata=search_meta,
+        )
 
     formatted = _format_message_snippets(snippets, f"for query '{query}'{filter_desc}")
-    return formatted
+    return ToolResult(content=formatted, metadata=search_meta)
 
 
 async def _handle_get_recent_observations(
@@ -1616,28 +2066,30 @@ async def _handle_get_peer_card(ctx: ToolContext, tool_input: dict[str, Any]) ->
 
 async def _handle_delete_observations(
     ctx: ToolContext, tool_input: dict[str, Any]
-) -> str:
+) -> "str | ToolResult":
     """Handle delete_observations tool."""
     observation_ids = tool_input.get("observation_ids", [])
     if not observation_ids:
         return "ERROR: observation_ids list is empty"
 
-    deleted_count = 0
     async with ctx.db_lock, tracked_db("tool.delete_observations") as db:
-        for obs_id in observation_ids:
-            try:
-                await crud.delete_document(
-                    db,
-                    workspace_name=ctx.workspace_name,
-                    document_id=obs_id,
-                    observer=ctx.observer,
-                    observed=ctx.observed,
-                )
-                deleted_count += 1
-            except Exception as e:
-                logger.warning("Failed to delete observation %s: %s", obs_id, e)
+        deleted = await crud.delete_documents(
+            db,
+            workspace_name=ctx.workspace_name,
+            document_ids=observation_ids,
+            observer=ctx.observer,
+            observed=ctx.observed,
+        )
 
-    # Emit telemetry event if context is available
+    deleted_ids = {doc_id for doc_id, _ in deleted}
+    for obs_id in observation_ids:
+        if obs_id not in deleted_ids:
+            logger.warning(
+                "Failed to delete observation %s (not found, already deleted, or wrong scope)",
+                obs_id,
+            )
+
+    deleted_count = len(deleted)
     if deleted_count > 0 and ctx.run_id and ctx.agent_type and ctx.parent_category:
         emit(
             AgentToolConclusionsDeletedEvent(
@@ -1649,10 +2101,20 @@ async def _handle_delete_observations(
                 observer=ctx.observer,
                 observed=ctx.observed,
                 conclusion_count=deleted_count,
+                levels=[level for _, level in deleted],
             )
         )
 
-    return f"Deleted {deleted_count} observations"
+    # +5: surface deleted_count + levels for DreamSpecialistEvent rollups.
+    from src.utils.types import ToolResult
+
+    return ToolResult(
+        content=f"Deleted {deleted_count} observations",
+        metadata={
+            "deleted_count": deleted_count,
+            "levels": [level for _, level in deleted],
+        },
+    )
 
 
 async def _handle_finish_consolidation(
@@ -1669,12 +2131,20 @@ async def _handle_extract_preferences(
 ) -> str:
     """Handle extract_preferences tool."""
     _ = tool_input
-    results = await extract_preferences(
+    # Wrap so the batch-embed + downstream search_messages embedding calls
+    # all carry preference-extraction attribution.
+    with embedding_call_purpose(
+        EmbeddingCallPurpose.PREFERENCE_EXTRACTION.value,
         workspace_name=ctx.workspace_name,
-        session_name=ctx.session_name,
-        observed=ctx.observed,
-        observer=ctx.observer,
-    )
+        run_id=ctx.run_id,
+        parent_category=ctx.parent_category,
+    ):
+        results = await extract_preferences(
+            workspace_name=ctx.workspace_name,
+            session_name=ctx.session_name,
+            observed=ctx.observed,
+            observer=ctx.observer,
+        )
 
     messages = results.get("messages", [])
 
@@ -1694,7 +2164,13 @@ async def _handle_extract_preferences(
 def _format_message_snippets(
     snippets: list[tuple[list[models.Message], list[models.Message]]], desc: str
 ) -> str:
-    """Format message snippets for output."""
+    """Format message snippets for output.
+
+    Returns bare `str` because callers concatenate it into other strings
+    or place it into `ToolResult.content`. Callers that need the
+    truncation telemetry signal route their own output through
+    `_maybe_truncated_result` themselves.
+    """
     snippet_texts: list[str] = []
     total_matches = sum(len(matches) for matches, _ in snippets)
     for i, (matches, context) in enumerate(snippets, 1):
@@ -1714,7 +2190,10 @@ def _format_message_snippets(
         f"Found {total_matches} matching messages in {len(snippets)} conversation snippets {desc}:\n\n"
         + "\n\n".join(snippet_texts)
     )
-    return _truncate_tool_output(output)
+    # `[0]` extracts the truncated text — telemetry signal is discarded here
+    # because callers wrap the result into ToolResult themselves (and so any
+    # downstream truncation telemetry should come from the caller's path).
+    return _truncate_tool_output(output)[0]
 
 
 async def _handle_get_reasoning_chain(
@@ -1753,9 +2232,7 @@ async def _handle_get_reasoning_chain(
                     premise_lines: list[Any] = []
                     for p in premises:
                         p_level = p.level or "explicit"
-                        premise_lines.append(
-                            f"  - [id:{p.id}] ({p_level}): {p.content}"
-                        )
+                        premise_lines.append(f" - [id:{p.id}] ({p_level}): {p.content}")
                     output_parts.append(
                         f"\n**Premises ({len(premises)}):**\n"
                         + "\n".join(premise_lines)
@@ -1772,7 +2249,7 @@ async def _handle_get_reasoning_chain(
                     source_lines: list[Any] = []
                     for s in sources:
                         s_level = s.level or "explicit"
-                        source_lines.append(f"  - [id:{s.id}] ({s_level}): {s.content}")
+                        source_lines.append(f" - [id:{s.id}] ({s_level}): {s.content}")
                     output_parts.append(
                         f"\n**Sources ({len(sources)}):**\n" + "\n".join(source_lines)
                     )
@@ -1800,7 +2277,7 @@ async def _handle_get_reasoning_chain(
                 child_lines: list[Any] = []
                 for c in children:
                     c_level = c.level or "explicit"
-                    child_lines.append(f"  - [id:{c.id}] ({c_level}): {c.content}")
+                    child_lines.append(f" - [id:{c.id}] ({c_level}): {c.content}")
                 output_parts.append(
                     f"\n**Derived Conclusions ({len(children)}):**\n"
                     + "\n".join(child_lines)
@@ -1814,6 +2291,8 @@ async def _handle_get_reasoning_chain(
 # Tool handler dispatch table
 _TOOL_HANDLERS: dict[str, Callable[[ToolContext, dict[str, Any]], Any]] = {
     "create_observations": _handle_create_observations,
+    "create_observations_deductive": _handle_create_observations_deductive,
+    "create_observations_inductive": _handle_create_observations_inductive,
     "update_peer_card": _handle_update_peer_card,
     "get_recent_history": _handle_get_recent_history,
     "search_memory": _handle_search_memory,
@@ -1901,34 +2380,188 @@ async def create_tool_executor(
         Returns:
             String result describing what was done
         """
-        logger.info("[tool call] %s %s", tool_name, tool_input)
+        import time
+
+        from src.utils.types import (
+            ToolResult,
+            get_current_iteration,
+            get_current_provider_tool_call_id,
+            get_current_tool_call_seq,
+            set_last_tool_metadata,
+        )
+
+        # Log nondisclosive call shape only. Raw `tool_input` can carry user
+        # content (search queries, peer-card text, etc.); the param keys are
+        # enough to reconstruct the call shape from telemetry without leaking
+        # content to log sinks.
+        logger.info("[tool call] %s keys=%s", tool_name, sorted(tool_input.keys()))
+
+        start = time.perf_counter()
+        # Defaults populated even on early returns / error paths so the
+        # AgentToolCallCompletedEvent emission below can fire consistently.
+        result_str: str = ""
+        metadata: dict[str, Any] = {}
+        is_error: bool = False
 
         try:
             handler = _TOOL_HANDLERS.get(tool_name)
             if handler:
-                result = await handler(ctx, tool_input)
-                logger.info("[tool result] %s %s", tool_name, result)
-                return result
-            return f"Unknown tool: {tool_name}"
+                handler_result = await handler(ctx, tool_input)
+                # Handlers return either a plain str (existing contract) or a
+                # ToolResult(content, metadata) carrying structured fields for
+                # telemetry and specialist rollups.
+                if isinstance(handler_result, ToolResult):
+                    result_str = handler_result.content
+                    metadata = handler_result.metadata
+                else:
+                    result_str = handler_result
+                # Log shape, not contents — `result_str` can carry retrieved
+                # observations, message snippets, peer-card text, etc. The
+                # AgentToolCallCompletedEvent telemetry captures the
+                # structured metadata for analytics.
+                logger.info(
+                    "[tool result] %s len=%d metadata_keys=%s",
+                    tool_name,
+                    len(result_str),
+                    sorted(metadata.keys()),
+                )
+            else:
+                result_str = f"Unknown tool: {tool_name}"
+                is_error = True
+                logger.warning(result_str)
 
+        except asyncio.CancelledError:
+            # Cancellation (client disconnect, server shutdown) — populate
+            # telemetry fields so the finally-block emit records an accurate
+            # event, then re-raise so cancellation propagates to the caller.
+            # CancelledError extends BaseException, so the broader except
+            # clauses below do not catch it.
+            result_str = f"Tool {tool_name} cancelled"
+            is_error = True
+            raise
         except ValueError as e:
             # Recoverable errors (bad input, validation failures) - return to LLM
-            error_msg = f"Tool {tool_name} failed with invalid input: {e}"
-            logger.warning(error_msg)
-            return error_msg
+            result_str = f"Tool {tool_name} failed with invalid input: {e}"
+            is_error = True
+            logger.warning(result_str)
         except KeyError as e:
             # Missing required parameters - return to LLM
-            error_msg = f"Tool {tool_name} missing required parameter: {e}"
-            logger.warning(error_msg)
-            return error_msg
+            result_str = f"Tool {tool_name} missing required parameter: {e}"
+            is_error = True
+            logger.warning(result_str)
         except Exception as e:
             # Unexpected errors - log with full traceback but still return to LLM
             # We don't re-raise because the LLM should be able to continue with other tools
-            error_msg = f"Tool {tool_name} failed unexpectedly: {type(e).__name__}: {e}"
-            logger.error(error_msg, exc_info=True)
+            result_str = (
+                f"Tool {tool_name} failed unexpectedly: {type(e).__name__}: {e}"
+            )
+            is_error = True
+            logger.error(result_str, exc_info=True)
             # No explicit rollback needed — each handler uses tracked_db() which
             # handles rollback in its finally block
-            return error_msg
+        finally:
+            # Emit in finally so CancelledError (and any other BaseException)
+            # still produces an AgentToolCallCompletedEvent before propagating.
+            duration_ms = (time.perf_counter() - start) * 1000
+
+            # Publish ToolResult.metadata for tool_loop to stash on all_tool_calls.
+            # Reset to {} (rather than leaving stale metadata) so a non-ToolResult
+            # handler doesn't appear to have leaked metadata from a prior call.
+            set_last_tool_metadata(metadata)
+
+            _emit_agent_tool_call_completed(
+                ctx=ctx,
+                tool_name=tool_name,
+                duration_ms=duration_ms,
+                result_str=result_str,
+                metadata=metadata,
+                is_error=is_error,
+                iteration=get_current_iteration(),
+                tool_call_seq=get_current_tool_call_seq(),
+                provider_tool_call_id=get_current_provider_tool_call_id(),
+            )
+
+        return result_str
 
     execute_tool._ctx = ctx  # type: ignore[attr-defined]
     return execute_tool
+
+
+def _emit_agent_tool_call_completed(
+    *,
+    ctx: "ToolContext",
+    tool_name: str,
+    duration_ms: float,
+    result_str: str,
+    metadata: dict[str, Any],
+    is_error: bool,
+    iteration: int,
+    tool_call_seq: int,
+    provider_tool_call_id: str | None,
+) -> None:
+    """Build and emit AgentToolCallCompletedEvent. Best-effort; swallows errors.
+
+    Skipped when the executor was constructed without agent identifiers
+    (run_id / agent_type / parent_category) — telemetry attribution requires
+    all three.
+    """
+    if not (ctx.run_id and ctx.agent_type and ctx.parent_category):
+        return
+    try:
+        from src.telemetry.events import AgentToolCallCompletedEvent, emit
+
+        emit(
+            AgentToolCallCompletedEvent(
+                run_id=ctx.run_id,
+                iteration=iteration,
+                tool_call_seq=tool_call_seq,
+                provider_tool_call_id=provider_tool_call_id,
+                parent_category=ctx.parent_category,
+                agent_type=ctx.agent_type,
+                workspace_name=ctx.workspace_name,
+                tool_name=tool_name,
+                duration_ms=duration_ms,
+                is_error=is_error,
+                result_chars=len(result_str),
+                result_chars_before_truncation=metadata.get(
+                    "result_chars_before_truncation"
+                ),
+                result_tokens_estimate=_estimate_tokens(result_str),
+                was_truncated=bool(metadata.get("was_truncated", False)),
+                query_tokens=metadata.get("query_tokens"),
+                top_k=metadata.get("top_k"),
+                results_count=metadata.get("results_count"),
+                used_embedding=metadata.get("used_embedding"),
+                embedding_query_count=int(metadata.get("embedding_query_count") or 0),
+            )
+        )
+    except Exception:  # pragma: no cover - telemetry must not raise
+        logger.debug("Failed to emit AgentToolCallCompletedEvent", exc_info=True)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Tiktoken-based size proxy for tool result strings. Best-effort."""
+    if not text:
+        return 0
+    try:
+        import tiktoken
+
+        # Use cl100k_base as a stable default — matches the embedding-client
+        # fallback. Exact accuracy isn't required; this is a size proxy.
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    except Exception:
+        # Fall back to a rough char→token ratio so the field is always populated.
+        return max(1, len(text) // 4)
+
+
+def _estimate_tokens_safe(text: str | None) -> int | None:
+    """Wrapper around `_estimate_tokens` that returns None on falsy input.
+
+    Used by search-handler metadata where we want `query_tokens=None`
+    when the query is empty rather than 0 (which could be confused with a
+    real measurement).
+    """
+    if not text:
+        return None
+    return _estimate_tokens(text)

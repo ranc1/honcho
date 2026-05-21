@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 
+from src._version import HONCHO_VERSION
 from src.cache.client import close_cache, init_cache
 from src.config import settings
 from src.db import engine, request_context
@@ -29,6 +30,7 @@ from src.routers import (
     workspaces,
 )
 from src.mcp_server import router as mcp_router
+from src.startup import validate_embedding_schema
 from src.telemetry import (
     initialize_telemetry_async,
     metrics_endpoint,
@@ -126,6 +128,12 @@ async def lifespan(_: FastAPI):
     # Initialize CloudEvents telemetry
     await initialize_telemetry_async()
 
+    # Validate embedding schema before serving any traffic. Fails closed: if
+    # the configured EMBEDDING_VECTOR_DIMENSIONS does not match the physical
+    # pgvector columns, the process refuses to start rather than silently
+    # writing wrong-dim vectors.
+    await validate_embedding_schema(engine)
+
     try:
         await init_cache()
     except Exception as e:
@@ -155,7 +163,7 @@ app = FastAPI(
     title="Honcho API",
     summary="The Identity Layer for the Agentic World",
     description="""Honcho is a platform for giving agents user-centric memory and social cognition.""",
-    version="3.0.6",
+    version=HONCHO_VERSION,
     contact={
         "name": "Plastic Labs",
         "url": "https://honcho.dev",

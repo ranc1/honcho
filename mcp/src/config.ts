@@ -8,6 +8,10 @@ export interface HonchoConfig {
   workspaceId: string;
 }
 
+export interface Env {
+  HONCHO_API_URL?: string;
+}
+
 /**
  * Read configuration from environment variables.
  * No longer requires a Request — all config comes from env vars.
