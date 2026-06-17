@@ -8,7 +8,7 @@
 
 ---
 
-Fork of [Honcho](https://github.com/plastic-labs/honcho) (v3.0.6) that adds an ACP (Agent Client Protocol) provider. Instead of calling LLM APIs directly, Honcho routes all LLM calls through an external ACP-compatible gateway via HTTP. All existing reasoning modules (deriver, dreamer, dialectic, summarizer) work without modification.
+Fork of [Honcho](https://github.com/plastic-labs/honcho) (v3.0.10) that adds an ACP (Agent Client Protocol) provider. Instead of calling LLM APIs directly, Honcho routes all LLM calls through an external ACP-compatible gateway via HTTP. All existing reasoning modules (deriver, dreamer, dialectic, summarizer) work without modification.
 
 This fork also fixes upstream bugs in the Conclusion API (`level` and `source_ids` fields) and configures embeddings for a local open-source model (`qwen3-embedding:0.6b` via Ollama, 1024 dimensions).
 
@@ -363,6 +363,26 @@ AUTH_USE_AUTH=false              # Disable auth for local deployment
 ```
 
 See `.env.template` for the full list of configuration options.
+
+Once auth is enabled, use `scripts/generate_jwt.py` to mint tokens for local
+development and scripting:
+
+```bash
+# Admin token (full access, no expiry)
+uv run python scripts/generate_jwt.py --admin
+
+# Admin token expiring in 24 hours
+uv run python scripts/generate_jwt.py --admin --expires 24h
+
+# Workspace-scoped token
+uv run python scripts/generate_jwt.py --workspace my-workspace --expires 30d
+
+# Capture a token for use in curl/scripts
+TOKEN=$(uv run python scripts/generate_jwt.py --admin --print-only)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/v3/workspaces
+```
+
+Duration units: `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks), `y` (years).
 
 5. **Run database migrations**
 
