@@ -561,7 +561,7 @@ async def create_documents(
                         VectorRecord(
                             id=doc.id,
                             embedding=embedding,
-                source_ids=getattr(obs, "source_ids", None),
+                            source_ids=doc.source_ids,
                             metadata={
                                 "workspace_name": workspace_name,
                                 "observer": observer,
@@ -829,12 +829,12 @@ async def create_observations(
                 observer=obs.observer_id,
                 observed=obs.observed_id,
                 content=obs.content,
-                level=getattr(obs, "level", None) or "explicit",  # Use provided level, default to explicit
+                level=obs.level or "explicit",  # Use provided level, default to explicit
                 times_derived=1,
                 internal_metadata={},  # No message_ids since not derived from messages
                 session_name=obs.session_id,
                 embedding=embedding,
-                source_ids=getattr(obs, "source_ids", None),
+                source_ids=obs.source_ids,
             )
         else:
             doc = models.Document(
@@ -842,11 +842,11 @@ async def create_observations(
                 observer=obs.observer_id,
                 observed=obs.observed_id,
                 content=obs.content,
-                level=getattr(obs, "level", None) or "explicit",  # Use provided level, default to explicit
+                level=obs.level or "explicit",  # Use provided level, default to explicit
                 times_derived=1,
                 internal_metadata={},  # No message_ids since not derived from messages
                 session_name=obs.session_id,
-                source_ids=getattr(obs, "source_ids", None),
+                source_ids=obs.source_ids,
             )
         doc.sync_state = "pending"
         honcho_documents.append(doc)

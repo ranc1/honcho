@@ -103,6 +103,22 @@ def detect_module(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | 
 # ---------------------------------------------------------------------------
 
 
+def _message_text(msg: dict[str, Any]) -> str:
+    """Flatten a message's content to plain text.
+
+    Handles both plain-string content and Anthropic-style lists of content
+    blocks (only the `text` blocks are kept).
+    """
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        return "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return content
+
+
 def build_agentic_prompt(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
@@ -122,16 +138,7 @@ def build_agentic_prompt(
     # Extract system and user messages
     for msg in messages:
         role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # Handle Anthropic-style content blocks
-            text_parts = [
-                block.get("text", "")
-                for block in content
-                if isinstance(block, dict) and block.get("type") == "text"
-            ]
-            content = "\n".join(text_parts)
-
+        content = _message_text(msg)
         if role == "system":
             parts.append(f"[System Instructions]\n{content}")
         elif role == "user":
@@ -187,7 +194,7 @@ def parse_deriver_response(text: str, response_model: type[BaseModel]) -> BaseMo
         result = response_model.model_validate(data)
         logger.info(f"Deriver response parsed successfully ({len(data.get('explicit', []))} explicit observations)")
         return result
-    except (json.JSONDecodeError, Exception) as e:
+    except Exception as e:
         logger.warning(f"Deriver response is not valid JSON — extraction skipped. Error: {e}. Response preview: {cleaned[:200]}")
         return response_model.model_validate({"explicit": []})
 
@@ -238,28 +245,21 @@ async def honcho_llm_call_inner_acp(
     module = detect_module(messages, tools)
 
     # Build the prompt
-    if tools and len(tools) > 0:
-        # Agentic call — construct combined prompt
+    is_agentic = bool(tools)
+    system_parts: list[str] = []
+    if is_agentic:
+        # Agentic call — system prompt is embedded in the combined prompt
         prompt_text = build_agentic_prompt(messages, tools)
     else:
-        # Non-agentic call — extract prompt from messages
+        # Non-agentic call — split messages into system vs. user/task text
         parts = []
-        system_parts = []
         for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_parts = [
-                    block.get("text", "")
-                    for block in content
-                    if isinstance(block, dict) and block.get("type") == "text"
-                ]
-                content = "\n".join(text_parts)
+            content = _message_text(msg)
             if msg.get("role") == "system":
                 system_parts.append(content)
             else:
                 parts.append(content)
         prompt_text = "\n\n".join(parts)
-        system_prompt = "\n\n".join(system_parts) if system_parts else None
 
     # Build the bridge request
     bridge_request: dict[str, Any] = {
@@ -276,10 +276,7 @@ async def honcho_llm_call_inner_acp(
             "If there are no facts to extract, call honcho_extract_facts with an empty explicit array."
         )
 
-    if tools and len(tools) > 0:
-        # For agentic calls, system prompt is already embedded in the combined prompt
-        pass
-    elif system_parts:
+    if system_parts:
         bridge_request["systemPrompt"] = "\n\n".join(system_parts)
 
     # POST to the gateway bridge
@@ -349,7 +346,7 @@ async def _fetch_extraction_result() -> str | None:
     Fetch extraction result from the MCP endpoint's extraction store.
     The MCP server runs in the FastAPI process (separate from the deriver).
     """
-    url = "http://localhost:8000/mcp/extraction"
+    url = f"{_MCP_BASE_URL}/mcp/extraction"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
             resp = await client.get(url)
